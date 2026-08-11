@@ -29,15 +29,16 @@
     .fullscreen .main-content { border-radius: 0 !important; }
     .fullscreen .content-scroll { max-height: 100vh !important; }
 
-    /* Spotlight tour */
+    /* Spotlight – dims everything except the highlighted element */
     .tour-highlight {
       position: relative;
       z-index: 70 !important;
-      box-shadow: 0 0 0 9999px rgba(0,0,0,0.7);  /* dim everything else */
-      border-radius: 0.75rem;                     /* smooth corner glow */
+      box-shadow: 0 0 0 9999px rgba(0,0,0,0.65);
+      border-radius: 0.75rem;
       transition: box-shadow 0.3s;
     }
-    /* Tooltip – fixed, above all */
+
+    /* Tooltip */
     .tour-tooltip {
       position: fixed;
       z-index: 80;
@@ -47,14 +48,27 @@
       border-radius: 1rem;
       padding: 1.25rem;
       max-width: 18rem;
+      width: calc(100% - 2rem);
       box-shadow: 0 25px 50px -12px rgba(0,0,0,0.5);
       font-size: 0.875rem;
       color: #e2e8f0;
       pointer-events: auto;
     }
-    .tour-tooltip button {
-      cursor: pointer;
+    /* Arrow pointer */
+    .tour-tooltip::before {
+      content: '';
+      position: absolute;
+      width: 12px;
+      height: 12px;
+      background: rgba(30,41,59,0.98);
+      border: 1px solid rgba(255,255,255,0.1);
+      transform: rotate(45deg);
+      border-radius: 2px;
     }
+    .tooltip-arrow-bottom::before { top: -6px; left: 20px; border-bottom: none; border-right: none; }
+    .tooltip-arrow-top::before { bottom: -6px; left: 20px; border-top: none; border-left: none; }
+    .tooltip-arrow-left::before { right: -6px; top: 20px; border-left: none; border-top: none; }
+    .tooltip-arrow-right::before { left: -6px; top: 20px; border-right: none; border-bottom: none; }
   </style>
 </head>
 <body class="bg-slate-950 text-slate-200 font-sans antialiased h-screen flex flex-col overflow-hidden">
@@ -156,8 +170,8 @@
     </main>
   </div>
 
-  <!-- Tour tooltip (fixed, outside flow) -->
-  <div id="tourTooltip" class="tour-tooltip hidden">
+  <!-- Tour tooltip (fixed) -->
+  <div id="tourTooltip" class="tour-tooltip hidden tooltip-arrow-bottom">
     <p id="tourText" class="mb-4 text-slate-200 text-sm"></p>
     <div class="flex justify-between items-center">
       <button id="tourSkip" class="text-xs text-slate-500 hover:text-white transition">Skip</button>
@@ -275,7 +289,7 @@
       container.querySelectorAll('hr').forEach(hr => hr.className = 'border-slate-800 my-6');
     }
 
-    // ─── TOUR (spotlight) ────────────────────────────
+    // ─── TOUR (mobile + desktop spotlight) ────────────
     const steps = [
       {
         text: "Select a documentation file here. Tap <b>Full</b> or <b>Short</b> to load it.",
@@ -291,28 +305,50 @@
       },
     ];
 
+    function removeArrowClasses() {
+      tourTooltip.classList.remove('tooltip-arrow-bottom', 'tooltip-arrow-top', 'tooltip-arrow-left', 'tooltip-arrow-right');
+    }
+
     function positionTooltip(targetEl) {
       const rect = targetEl.getBoundingClientRect();
       const tooltipWidth = tourTooltip.offsetWidth;
       const tooltipHeight = tourTooltip.offsetHeight;
       const margin = 16;
+      let top, left;
+      removeArrowClasses();
 
-      // Try to place below, if not enough space place above
-      let top = rect.bottom + margin;
-      let left = rect.left + (rect.width / 2) - (tooltipWidth / 2);
+      // Determine best placement (bottom/right/top/left) avoiding overlap
+      const spaceBottom = window.innerHeight - rect.bottom - margin;
+      const spaceTop = rect.top - margin;
+      const spaceRight = window.innerWidth - rect.right - margin;
+      const spaceLeft = rect.left - margin;
 
-      // Clamp left/right so tooltip never goes off-screen
-      if (left < margin) left = margin;
-      if (left + tooltipWidth > window.innerWidth - margin) {
-        left = window.innerWidth - tooltipWidth - margin;
-      }
-
-      // If below goes off-screen, flip to above
-      if (top + tooltipHeight > window.innerHeight - margin) {
+      // Prefer bottom if enough space, else top, else right/left
+      if (spaceBottom >= tooltipHeight + margin) {
+        top = rect.bottom + margin;
+        left = rect.left + rect.width/2 - tooltipWidth/2;
+        tourTooltip.classList.add('tooltip-arrow-bottom');
+      } else if (spaceTop >= tooltipHeight + margin) {
         top = rect.top - tooltipHeight - margin;
+        left = rect.left + rect.width/2 - tooltipWidth/2;
+        tourTooltip.classList.add('tooltip-arrow-top');
+      } else if (spaceRight >= tooltipWidth + margin) {
+        top = rect.top + rect.height/2 - tooltipHeight/2;
+        left = rect.right + margin;
+        tourTooltip.classList.add('tooltip-arrow-left');
+      } else if (spaceLeft >= tooltipWidth + margin) {
+        top = rect.top + rect.height/2 - tooltipHeight/2;
+        left = rect.left - tooltipWidth - margin;
+        tourTooltip.classList.add('tooltip-arrow-right');
+      } else {
+        // Fallback: center on screen
+        top = Math.max(margin, (window.innerHeight - tooltipHeight) / 2);
+        left = Math.max(margin, (window.innerWidth - tooltipWidth) / 2);
       }
-      // Final safety
-      if (top < margin) top = margin;
+
+      // Clamp to keep tooltip fully visible
+      left = Math.min(Math.max(left, margin), window.innerWidth - tooltipWidth - margin);
+      top = Math.min(Math.max(top, margin), window.innerHeight - tooltipHeight - margin);
 
       tourTooltip.style.top = top + 'px';
       tourTooltip.style.left = left + 'px';
@@ -330,13 +366,11 @@
       element.classList.add('tour-highlight');
       highlightedElement = element;
 
-      // Update tooltip content
       tourText.innerHTML = step.text;
       tourNext.textContent = stepIndex === steps.length - 1 ? 'Finish' : 'Next';
 
-      // Show tooltip
       tourTooltip.classList.remove('hidden');
-      // Position after a tiny delay to get correct dimensions
+      // Wait for layout to get accurate tooltip dimensions
       requestAnimationFrame(() => {
         positionTooltip(element);
       });
@@ -357,14 +391,10 @@
 
     // Reposition on resize/scroll
     window.addEventListener('resize', () => {
-      if (currentStep !== -1 && highlightedElement) {
-        positionTooltip(highlightedElement);
-      }
+      if (currentStep !== -1 && highlightedElement) positionTooltip(highlightedElement);
     });
     window.addEventListener('scroll', () => {
-      if (currentStep !== -1 && highlightedElement) {
-        positionTooltip(highlightedElement);
-      }
+      if (currentStep !== -1 && highlightedElement) positionTooltip(highlightedElement);
     }, true);
 
     function startTour() {
@@ -374,7 +404,7 @@
     helpBtn.addEventListener('click', startTour);
     helpBtnDesktop.addEventListener('click', startTour);
 
-    // Auto-start on first visit (all devices)
+    // Auto-start tour on first visit (any device)
     if (!localStorage.getItem('tourSeen')) {
       setTimeout(startTour, 800);
     }
