@@ -7,7 +7,6 @@
   <script src="https://cdn.tailwindcss.com"></script>
   <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
   <style>
-    /* ---- Custom animations ---- */
     @keyframes fadeInUp {
       from { opacity: 0; transform: translateY(20px) scale(0.98); }
       to   { opacity: 1; transform: translateY(0) scale(1); }
@@ -28,11 +27,14 @@
       animation: shimmer 1.8s infinite;
     }
 
-    /* ---- Scrollable content area + custom scrollbar ---- */
+    /* Scrollable content area */
     .markdown-content {
-      max-height: 65vh;                /* scroll inside the card, not the page */
+      max-height: 65vh;
       overflow-y: auto;
-      padding-right: 8px;              /* space for the scrollbar */
+      padding-right: 8px;
+    }
+    .fullscreen .markdown-content {
+      max-height: calc(100vh - 6rem); /* full screen with room for header/controls */
     }
 
     .markdown-content::-webkit-scrollbar {
@@ -45,70 +47,111 @@
       background: rgba(255,255,255,0.12);
       border-radius: 3px;
     }
-    .markdown-content::-webkit-scrollbar-thumb:hover {
-      background: rgba(255,255,255,0.2);
+
+    /* Fullscreen card transition */
+    .main-card {
+      transition: all 0.4s cubic-bezier(0.25, 0.46, 0.45, 0.94);
+      border-radius: 1.5rem;
+    }
+    .fullscreen .main-card {
+      position: fixed;
+      inset: 0;
+      z-index: 50;
+      border-radius: 0 !important;
+      margin: 0;
+      max-width: 100vw;
+      padding: 1.5rem !important;
+      background: #0b0f17 !important; /* solid background for immersion */
+      backdrop-filter: none;
+      border: none;
+      box-shadow: none;
     }
 
-    /* ---- Dropdown transition ---- */
-    .dropdown-enter {
-      opacity: 0;
-      transform: translateY(-8px);
+    /* Hide background blobs in fullscreen */
+    .fullscreen .bg-blobs {
+      display: none;
     }
-    .dropdown-enter-active {
-      opacity: 1;
-      transform: translateY(0);
-      transition: all 0.2s ease-out;
+
+    /* Fullscreen toggle button */
+    .fs-toggle {
+      cursor: pointer;
+      transition: transform 0.3s;
+    }
+    .fs-toggle:hover {
+      transform: scale(1.1);
+      color: #fff;
     }
   </style>
 </head>
-<body class="bg-[#0b0f17] min-h-screen flex items-center justify-center p-6 relative overflow-hidden">
-  <!-- Ambient background -->
-  <div class="fixed inset-0 -z-10">
+<body class="bg-[#0b0f17] min-h-screen flex items-center justify-center p-3 sm:p-6 relative overflow-hidden">
+
+  <!-- Ambient background blobs (hidden on fullscreen) -->
+  <div class="bg-blobs fixed inset-0 -z-10">
     <div class="absolute top-0 left-0 w-full h-full bg-gradient-to-br from-indigo-900/20 via-transparent to-purple-900/20 animate-pulse"></div>
     <div class="absolute top-1/4 left-1/4 w-96 h-96 bg-indigo-500/10 rounded-full blur-3xl animate-pulse"></div>
-    <div class="absolute bottom-1/4 right-1/4 w-96 h-96 bg-purple-500/10 rounded-full blur-3xl animate-pulse animation-delay-2000"></div>
+    <div class="absolute bottom-1/4 right-1/4 w-96 h-96 bg-purple-500/10 rounded-full blur-3xl animate-pulse"></div>
   </div>
 
-  <div class="w-full max-w-4xl animate-fade-in-up">
-    <!-- Main glass card -->
-    <div class="bg-[#131a28]/80 backdrop-blur-2xl border border-white/5 rounded-3xl shadow-2xl shadow-black/50 p-8 md:p-10 transition-all duration-300 hover:border-white/10 hover:shadow-[0_30px_60px_-15px_rgba(0,0,0,0.6)]">
-      <!-- Header -->
-      <div class="flex items-center gap-3 mb-1">
-        <span class="text-4xl bg-gradient-to-br from-indigo-400 to-purple-400 bg-clip-text text-transparent">📄</span>
-        <h1 class="text-4xl md:text-5xl font-bold bg-gradient-to-r from-slate-100 to-slate-300 bg-clip-text text-transparent tracking-tight">README Viewer</h1>
+  <!-- Main container -->
+  <div class="w-full max-w-4xl animate-fade-in-up" id="appContainer">
+    <!-- Main card -->
+    <div class="main-card bg-[#131a28]/80 backdrop-blur-2xl border border-white/5 rounded-3xl shadow-2xl shadow-black/50 p-6 sm:p-8 md:p-10 transition-all duration-300 hover:border-white/10 hover:shadow-[0_30px_60px_-15px_rgba(0,0,0,0.6)]">
+      <!-- Header with fullscreen button on large screens -->
+      <div class="flex items-center justify-between gap-3 mb-1">
+        <div class="flex items-center gap-3">
+          <span class="text-3xl sm:text-4xl bg-gradient-to-br from-indigo-400 to-purple-400 bg-clip-text text-transparent">📄</span>
+          <h1 class="text-3xl sm:text-4xl md:text-5xl font-bold bg-gradient-to-r from-slate-100 to-slate-300 bg-clip-text text-transparent tracking-tight">README Viewer</h1>
+        </div>
+        <!-- Fullscreen toggle (visible only when content loaded) -->
+        <div id="fsToggleContainer" class="hidden sm:flex items-center">
+          <button id="fsToggleBtn" class="fs-toggle p-2 rounded-xl hover:bg-white/5 text-slate-400 hover:text-white transition" title="Toggle fullscreen">
+            <svg id="fsIconEnter" xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <polyline points="15 3 21 3 21 9"></polyline>
+              <polyline points="9 21 3 21 3 15"></polyline>
+              <line x1="21" y1="3" x2="14" y2="10"></line>
+              <line x1="3" y1="21" x2="10" y2="14"></line>
+            </svg>
+            <svg id="fsIconExit" xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="hidden">
+              <polyline points="4 8 4 4 8 4"></polyline>
+              <polyline points="16 4 20 4 20 8"></polyline>
+              <polyline points="20 16 20 20 16 20"></polyline>
+              <polyline points="8 20 4 20 4 16"></polyline>
+            </svg>
+          </button>
+        </div>
       </div>
-      <p class="text-slate-400 text-lg mb-10 font-light">Select a documentation variant to preview its contents</p>
+      <p class="text-slate-400 text-base sm:text-lg mb-8 font-light">Select a documentation variant to preview its contents</p>
 
       <!-- Selector + button -->
-      <div class="flex flex-col md:flex-row gap-4 mb-10">
+      <div class="flex flex-col sm:flex-row gap-3 mb-8">
         <!-- Custom dropdown -->
         <div class="relative flex-1" id="dropdownWrapper">
-          <button id="dropdownBtn" class="w-full flex items-center justify-between px-5 py-4 bg-white/5 border border-white/10 rounded-2xl text-slate-200 hover:bg-white/10 hover:border-white/20 focus:outline-none focus:ring-2 focus:ring-indigo-500/50 transition-all duration-200 group">
-            <span id="selectedText" class="font-medium">📘 Full Documentation</span>
+          <button id="dropdownBtn" class="w-full flex items-center justify-between px-4 py-3.5 sm:px-5 sm:py-4 bg-white/5 border border-white/10 rounded-2xl text-slate-200 hover:bg-white/10 hover:border-white/20 focus:outline-none focus:ring-2 focus:ring-indigo-500/50 transition-all duration-200 group">
+            <span id="selectedText" class="font-medium text-sm sm:text-base">📘 Full Documentation</span>
             <svg class="w-5 h-5 text-indigo-400 transition-transform duration-200 group-hover:rotate-180" fill="none" viewBox="0 0 24 24" stroke="currentColor">
               <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7" />
             </svg>
           </button>
           <div id="dropdownMenu" class="absolute left-0 right-0 mt-2 bg-[#1a2235]/95 backdrop-blur-xl border border-white/10 rounded-2xl shadow-2xl overflow-hidden z-10 hidden dropdown-enter">
-            <div data-value="Documentation/readme.md" class="px-5 py-3.5 hover:bg-white/5 cursor-pointer flex items-center gap-3 text-slate-300 transition-colors hover:text-white dropdown-option">
+            <div data-value="Documentation/readme.md" class="px-4 py-3 sm:px-5 sm:py-3.5 hover:bg-white/5 cursor-pointer flex items-center gap-3 text-slate-300 text-sm sm:text-base transition-colors hover:text-white dropdown-option">
               <span>📘</span> Full Documentation
             </div>
-            <div data-value="Documentation-Short/readme.md" class="px-5 py-3.5 hover:bg-white/5 cursor-pointer flex items-center gap-3 text-slate-300 transition-colors hover:text-white dropdown-option">
+            <div data-value="Documentation-Short/readme.md" class="px-4 py-3 sm:px-5 sm:py-3.5 hover:bg-white/5 cursor-pointer flex items-center gap-3 text-slate-300 text-sm sm:text-base transition-colors hover:text-white dropdown-option">
               <span>📙</span> Short Documentation
             </div>
           </div>
         </div>
-        <button id="loadBtn" class="group relative px-8 py-4 bg-indigo-600 hover:bg-indigo-500 text-white font-semibold rounded-2xl transition-all duration-300 hover:shadow-[0_12px_30px_-8px_rgba(99,102,241,0.5)] active:scale-95 overflow-hidden">
-          <span class="relative z-10 flex items-center gap-2">
-            <span class="text-xl">✨</span> Load
+        <button id="loadBtn" class="group relative px-6 py-3.5 sm:px-8 sm:py-4 bg-indigo-600 hover:bg-indigo-500 text-white font-semibold rounded-2xl transition-all duration-300 hover:shadow-[0_12px_30px_-8px_rgba(99,102,241,0.5)] active:scale-95 overflow-hidden w-full sm:w-auto">
+          <span class="relative z-10 flex items-center justify-center gap-2">
+            <span class="text-lg sm:text-xl">✨</span> Load
           </span>
           <div class="absolute inset-0 bg-gradient-to-r from-indigo-400 to-purple-400 opacity-0 group-hover:opacity-20 transition-opacity duration-300"></div>
         </button>
       </div>
 
-      <!-- Content area with scrolling + markdown styling -->
-      <div id="content" class="bg-black/30 border border-white/5 rounded-2xl p-8 transition-opacity duration-200 relative overflow-hidden">
-        <p class="text-slate-500 italic text-center mt-12">Select a file and click <strong class="text-slate-400">Load</strong> to render it here.</p>
+      <!-- Content area -->
+      <div id="content" class="bg-black/30 border border-white/5 rounded-2xl p-5 sm:p-8 transition-opacity duration-200 relative overflow-hidden">
+        <p class="text-slate-500 italic text-center mt-8 sm:mt-12">Select a file and click <strong class="text-slate-400">Load</strong> to render it here.</p>
       </div>
     </div>
   </div>
@@ -119,7 +162,13 @@
     const selectedText = document.getElementById('selectedText');
     const loadBtn = document.getElementById('loadBtn');
     const contentDiv = document.getElementById('content');
+    const fsToggleContainer = document.getElementById('fsToggleContainer');
+    const fsToggleBtn = document.getElementById('fsToggleBtn');
+    const appContainer = document.getElementById('appContainer');
+    const fsIconEnter = document.getElementById('fsIconEnter');
+    const fsIconExit = document.getElementById('fsIconExit');
     let selectedValue = 'Documentation/readme.md';
+    let isFullscreen = false;
 
     // Dropdown logic
     dropdownBtn.addEventListener('click', () => {
@@ -141,8 +190,36 @@
       });
     });
 
-    // Load markdown with improved styling
+    // Fullscreen toggle
+    fsToggleBtn.addEventListener('click', () => {
+      isFullscreen = !isFullscreen;
+      if (isFullscreen) {
+        appContainer.classList.add('fullscreen');
+        fsIconEnter.classList.add('hidden');
+        fsIconExit.classList.remove('hidden');
+        // Scroll to top of content for better reading
+        document.querySelector('.markdown-content')?.scrollTo(0, 0);
+      } else {
+        appContainer.classList.remove('fullscreen');
+        fsIconEnter.classList.remove('hidden');
+        fsIconExit.classList.add('hidden');
+      }
+    });
+
+    // Escape key to exit fullscreen
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && isFullscreen) {
+        fsToggleBtn.click();
+      }
+    });
+
+    // Load markdown with rich styling
     async function loadReadme(path) {
+      // Show fullscreen button after first load
+      fsToggleContainer.classList.remove('hidden');
+      // Reset fullscreen if active
+      if (isFullscreen) fsToggleBtn.click();
+
       contentDiv.classList.add('shimmer', 'relative');
       try {
         const response = await fetch(path);
@@ -152,80 +229,40 @@
           contentDiv.classList.remove('shimmer');
           contentDiv.innerHTML = marked.parse(markdown);
 
-          // Add scrollable wrapper + markdown semantic classes
           const wrapper = document.createElement('div');
           wrapper.className = 'markdown-content text-slate-200 space-y-4';
-          // Move parsed content into wrapper
-          while (contentDiv.firstChild) {
-            wrapper.appendChild(contentDiv.firstChild);
-          }
+          while (contentDiv.firstChild) wrapper.appendChild(contentDiv.firstChild);
           contentDiv.appendChild(wrapper);
 
-          // ---- Style markdown elements to look like QuickLook / polished docs ----
-          // Headings
-          wrapper.querySelectorAll('h1').forEach(h => {
-            h.className = 'text-3xl font-bold text-slate-100 mt-10 mb-4 tracking-tight';
-          });
-          wrapper.querySelectorAll('h2').forEach(h => {
-            h.className = 'text-2xl font-semibold text-slate-100 mt-8 mb-3 pb-2 border-b border-white/10';
-          });
-          wrapper.querySelectorAll('h3').forEach(h => {
-            h.className = 'text-xl font-semibold text-slate-200 mt-6 mb-2';
-          });
-          // Paragraphs
-          wrapper.querySelectorAll('p').forEach(p => {
-            p.className = 'leading-relaxed text-slate-300 mb-4';
-          });
-          // Lists
-          wrapper.querySelectorAll('ul, ol').forEach(list => {
-            list.className = 'pl-6 mb-4 space-y-2 text-slate-300';
-          });
-          wrapper.querySelectorAll('li').forEach(li => {
-            li.className = 'leading-relaxed';
-          });
-          // Code blocks
-          wrapper.querySelectorAll('pre').forEach(pre => {
-            pre.className = 'bg-black/40 border border-white/5 rounded-xl p-5 overflow-x-auto my-6 text-sm';
-            const code = pre.querySelector('code');
-            if (code) code.className = 'text-indigo-200 font-mono';
-          });
-          // Inline code
-          wrapper.querySelectorAll('code:not(pre code)').forEach(code => {
-            code.className = 'bg-black/40 text-indigo-300 px-1.5 py-0.5 rounded-md font-mono text-sm';
-          });
-          // Links
-          wrapper.querySelectorAll('a').forEach(a => {
-            a.className = 'text-indigo-400 hover:text-indigo-300 underline decoration-indigo-400/30 underline-offset-2 transition';
-          });
-          // Blockquotes
-          wrapper.querySelectorAll('blockquote').forEach(bq => {
-            bq.className = 'border-l-4 border-indigo-500/50 pl-4 italic text-slate-400 my-6';
-          });
-          // Images
-          wrapper.querySelectorAll('img').forEach(img => {
-            img.className = 'max-w-full rounded-xl my-4';
-          });
-          // Tables (if any)
+          // ---- Premium Markdown Styling ----
+          wrapper.querySelectorAll('h1').forEach(h => h.className = 'text-2xl sm:text-3xl font-bold text-slate-100 mt-8 mb-4 tracking-tight');
+          wrapper.querySelectorAll('h2').forEach(h => h.className = 'text-xl sm:text-2xl font-semibold text-slate-100 mt-6 mb-3 pb-2 border-b border-white/10');
+          wrapper.querySelectorAll('h3').forEach(h => h.className = 'text-lg sm:text-xl font-semibold text-slate-200 mt-5 mb-2');
+          wrapper.querySelectorAll('p').forEach(p => p.className = 'leading-relaxed text-slate-300 mb-4 text-sm sm:text-base');
+          wrapper.querySelectorAll('ul, ol').forEach(list => list.className = 'pl-5 sm:pl-6 mb-4 space-y-2 text-slate-300 text-sm sm:text-base');
+          wrapper.querySelectorAll('li').forEach(li => li.className = 'leading-relaxed');
+          wrapper.querySelectorAll('pre').forEach(pre => pre.className = 'bg-black/40 border border-white/5 rounded-xl p-3 sm:p-5 overflow-x-auto my-4 sm:my-6 text-xs sm:text-sm');
+          wrapper.querySelectorAll('pre code').forEach(code => code.className = 'text-indigo-200 font-mono');
+          wrapper.querySelectorAll('code:not(pre code)').forEach(code => code.className = 'bg-black/40 text-indigo-300 px-1.5 py-0.5 rounded-md font-mono text-xs sm:text-sm');
+          wrapper.querySelectorAll('a').forEach(a => a.className = 'text-indigo-400 hover:text-indigo-300 underline decoration-indigo-400/30 underline-offset-2 transition');
+          wrapper.querySelectorAll('blockquote').forEach(bq => bq.className = 'border-l-4 border-indigo-500/50 pl-3 sm:pl-4 italic text-slate-400 my-4 sm:my-6');
+          wrapper.querySelectorAll('img').forEach(img => img.className = 'max-w-full rounded-xl my-4');
           wrapper.querySelectorAll('table').forEach(table => {
-            table.className = 'w-full border-collapse my-6 text-sm';
-            table.querySelectorAll('th').forEach(th => th.className = 'border border-white/10 px-4 py-2 bg-white/5 text-left font-semibold');
-            table.querySelectorAll('td').forEach(td => td.className = 'border border-white/10 px-4 py-2');
+            table.className = 'w-full border-collapse my-6 text-xs sm:text-sm';
+            table.querySelectorAll('th').forEach(th => th.className = 'border border-white/10 px-3 py-2 bg-white/5 text-left font-semibold');
+            table.querySelectorAll('td').forEach(td => td.className = 'border border-white/10 px-3 py-2');
           });
-          // Horizontal rules
-          wrapper.querySelectorAll('hr').forEach(hr => {
-            hr.className = 'border-white/10 my-8';
-          });
+          wrapper.querySelectorAll('hr').forEach(hr => hr.className = 'border-white/10 my-6 sm:my-8');
         }, 300);
       } catch (error) {
         contentDiv.classList.remove('shimmer');
-        contentDiv.innerHTML = `<div class="bg-red-900/20 border border-red-800/30 rounded-xl p-5 text-red-300 flex gap-3"><span>⚠️</span> Could not load <code class="bg-red-900/40 px-1.5 py-0.5 rounded">${path}</code>: ${error.message}</div>`;
+        contentDiv.innerHTML = `<div class="bg-red-900/20 border border-red-800/30 rounded-xl p-4 sm:p-5 text-red-300 flex gap-3 text-sm sm:text-base"><span>⚠️</span> Could not load <code class="bg-red-900/40 px-1.5 py-0.5 rounded">${path}</code>: ${error.message}</div>`;
+        fsToggleContainer.classList.add('hidden');
       }
     }
 
     loadBtn.addEventListener('click', () => loadReadme(selectedValue));
-
-    // Optional: auto-load the first file on page load
-    // loadReadme('Documentation/readme.md');
+    // Optional auto-load: loadReadme('Documentation/readme.md');
   </script>
 </body>
 </html>
