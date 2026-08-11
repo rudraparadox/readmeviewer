@@ -4,71 +4,186 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>README Viewer</title>
-  <!-- Markdown parser from CDN -->
+  <script src="https://cdn.tailwindcss.com"></script>
   <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
   <style>
-    body {
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-      max-width: 900px;
-      margin: 2rem auto;
-      padding: 0 1rem;
+    /* Custom animations */
+    @keyframes fadeInUp {
+      from {
+        opacity: 0;
+        transform: translateY(20px) scale(0.98);
+      }
+      to {
+        opacity: 1;
+        transform: translateY(0) scale(1);
+      }
     }
-    select, button {
-      font-size: 1rem;
-      padding: 0.4em 1em;
-      margin-right: 1em;
+    .animate-fade-in-up {
+      animation: fadeInUp 0.5s cubic-bezier(0.16, 1, 0.3, 1) forwards;
     }
-    #content {
-      margin-top: 2rem;
-      border: 1px solid #ddd;
-      padding: 1.5rem;
-      border-radius: 8px;
-      background: #fafafa;
+
+    @keyframes shimmer {
+      0% { transform: translateX(-100%); }
+      100% { transform: translateX(100%); }
     }
-    /* Basic styling for rendered Markdown */
-    #content h1, #content h2, #content h3 { margin-top: 1.5em; }
-    #content pre { background: #eee; padding: 1em; border-radius: 4px; overflow-x: auto; }
-    #content code { background: #eee; padding: 0.2em 0.4em; border-radius: 3px; }
-    #content img { max-width: 100%; }
+    .shimmer::after {
+      content: "";
+      position: absolute;
+      inset: 0;
+      background: linear-gradient(90deg, transparent, rgba(255,255,255,0.03), transparent);
+      animation: shimmer 1.8s infinite;
+    }
+
+    /* Custom scrollbar */
+    ::-webkit-scrollbar {
+      width: 6px;
+      height: 6px;
+    }
+    ::-webkit-scrollbar-track {
+      background: transparent;
+    }
+    ::-webkit-scrollbar-thumb {
+      background: rgba(255,255,255,0.15);
+      border-radius: 3px;
+    }
+
+    /* Dropdown transition */
+    .dropdown-enter {
+      opacity: 0;
+      transform: translateY(-8px);
+    }
+    .dropdown-enter-active {
+      opacity: 1;
+      transform: translateY(0);
+      transition: all 0.2s ease-out;
+    }
   </style>
 </head>
-<body>
-  <h1>📄 README Selector</h1>
-  <label for="fileSelect">Choose documentation:</label>
-  <select id="fileSelect">
-    <option value="Documentation/readme.md">Full Documentation</option>
-    <option value="Documentation-Short/readme.md">Short Documentation</option>
-  </select>
-  <button id="loadBtn">Load</button>
+<body class="bg-[#0b0f17] min-h-screen flex items-center justify-center p-6 relative overflow-hidden">
+  <!-- Animated ambient background -->
+  <div class="fixed inset-0 -z-10">
+    <div class="absolute top-0 left-0 w-full h-full bg-gradient-to-br from-indigo-900/20 via-transparent to-purple-900/20 animate-pulse"></div>
+    <div class="absolute top-1/4 left-1/4 w-96 h-96 bg-indigo-500/10 rounded-full blur-3xl animate-pulse"></div>
+    <div class="absolute bottom-1/4 right-1/4 w-96 h-96 bg-purple-500/10 rounded-full blur-3xl animate-pulse animation-delay-2000"></div>
+  </div>
 
-  <div id="content">
-    <p><em>Select a file and click "Load" to see the content.</em></p>
+  <div class="w-full max-w-4xl animate-fade-in-up">
+    <!-- Main glass card -->
+    <div class="bg-[#131a28]/80 backdrop-blur-2xl border border-white/5 rounded-3xl shadow-2xl shadow-black/50 p-8 md:p-10 transition-all duration-300 hover:border-white/10 hover:shadow-[0_30px_60px_-15px_rgba(0,0,0,0.6)]">
+      <!-- Header -->
+      <div class="flex items-center gap-3 mb-1">
+        <span class="text-4xl bg-gradient-to-br from-indigo-400 to-purple-400 bg-clip-text text-transparent">📄</span>
+        <h1 class="text-4xl md:text-5xl font-bold bg-gradient-to-r from-slate-100 to-slate-300 bg-clip-text text-transparent tracking-tight">README Viewer</h1>
+      </div>
+      <p class="text-slate-400 text-lg mb-10 font-light">Select a documentation variant to preview its contents</p>
+
+      <!-- Selector and button -->
+      <div class="flex flex-col md:flex-row gap-4 mb-10">
+        <!-- Custom Dropdown -->
+        <div class="relative flex-1" id="dropdownWrapper">
+          <button id="dropdownBtn" class="w-full flex items-center justify-between px-5 py-4 bg-white/5 border border-white/10 rounded-2xl text-slate-200 hover:bg-white/10 hover:border-white/20 focus:outline-none focus:ring-2 focus:ring-indigo-500/50 transition-all duration-200 group">
+            <span id="selectedText" class="font-medium">📘 Full Documentation</span>
+            <svg class="w-5 h-5 text-indigo-400 transition-transform duration-200 group-hover:rotate-180" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7" />
+            </svg>
+          </button>
+          <div id="dropdownMenu" class="absolute left-0 right-0 mt-2 bg-[#1a2235]/95 backdrop-blur-xl border border-white/10 rounded-2xl shadow-2xl overflow-hidden z-10 hidden dropdown-enter">
+            <div data-value="Documentation/readme.md" class="px-5 py-3.5 hover:bg-white/5 cursor-pointer flex items-center gap-3 text-slate-300 transition-colors hover:text-white dropdown-option">
+              <span>📘</span> Full Documentation
+            </div>
+            <div data-value="Documentation-Short/readme.md" class="px-5 py-3.5 hover:bg-white/5 cursor-pointer flex items-center gap-3 text-slate-300 transition-colors hover:text-white dropdown-option">
+              <span>📙</span> Short Documentation
+            </div>
+          </div>
+        </div>
+        <button id="loadBtn" class="group relative px-8 py-4 bg-indigo-600 hover:bg-indigo-500 text-white font-semibold rounded-2xl transition-all duration-300 hover:shadow-[0_12px_30px_-8px_rgba(99,102,241,0.5)] active:scale-95 overflow-hidden">
+          <span class="relative z-10 flex items-center gap-2">
+            <span class="text-xl">✨</span> Load
+          </span>
+          <div class="absolute inset-0 bg-gradient-to-r from-indigo-400 to-purple-400 opacity-0 group-hover:opacity-20 transition-opacity duration-300"></div>
+        </button>
+      </div>
+
+      <!-- Content area -->
+      <div id="content" class="bg-black/30 border border-white/5 rounded-2xl p-8 min-h-[300px] transition-opacity duration-200 relative overflow-hidden">
+        <p class="text-slate-500 italic text-center mt-12">Select a file and click <strong class="text-slate-400">Load</strong> to render it here.</p>
+      </div>
+    </div>
   </div>
 
   <script>
-    const select = document.getElementById('fileSelect');
+    // Custom dropdown logic
+    const dropdownBtn = document.getElementById('dropdownBtn');
+    const dropdownMenu = document.getElementById('dropdownMenu');
+    const selectedText = document.getElementById('selectedText');
     const loadBtn = document.getElementById('loadBtn');
     const contentDiv = document.getElementById('content');
+    let selectedValue = 'Documentation/readme.md';
 
+    dropdownBtn.addEventListener('click', () => {
+      dropdownMenu.classList.toggle('hidden');
+      dropdownMenu.classList.toggle('dropdown-enter-active');
+    });
+
+    // Close dropdown when clicking outside
+    document.addEventListener('click', (e) => {
+      if (!dropdownBtn.contains(e.target) && !dropdownMenu.contains(e.target)) {
+        dropdownMenu.classList.add('hidden');
+        dropdownMenu.classList.remove('dropdown-enter-active');
+      }
+    });
+
+    // Handle option selection
+    document.querySelectorAll('.dropdown-option').forEach(option => {
+      option.addEventListener('click', () => {
+        const value = option.getAttribute('data-value');
+        const text = option.innerText.trim();
+        selectedText.innerHTML = text;
+        selectedValue = value;
+        dropdownMenu.classList.add('hidden');
+        dropdownMenu.classList.remove('dropdown-enter-active');
+      });
+    });
+
+    // Load markdown with shimmer and fade
     async function loadReadme(path) {
+      contentDiv.classList.add('shimmer');
+      contentDiv.classList.add('relative');
       try {
         const response = await fetch(path);
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
         const markdown = await response.text();
-        // Convert Markdown to HTML using marked
-        contentDiv.innerHTML = marked.parse(markdown);
+        // Simulate network delay for shimmer effect (remove setTimeout in production)
+        setTimeout(() => {
+          contentDiv.classList.remove('shimmer');
+          contentDiv.innerHTML = marked.parse(markdown);
+          // Apply Tailwind prose-like styling (optional but clean)
+          contentDiv.querySelectorAll('h1,h2,h3,p,pre,code,ul,ol,li,a,blockquote').forEach(el => {
+            el.classList.add('text-slate-200');
+          });
+          // Special styling
+          contentDiv.querySelectorAll('pre').forEach(pre => {
+            pre.classList.add('bg-black/40', 'p-6', 'rounded-xl', 'border', 'border-white/5', 'overflow-x-auto', 'my-6');
+          });
+          contentDiv.querySelectorAll('code:not(pre code)').forEach(code => {
+            code.classList.add('bg-black/40', 'px-2', 'py-0.5', 'rounded-md', 'text-indigo-300');
+          });
+          contentDiv.querySelectorAll('a').forEach(a => {
+            a.classList.add('text-indigo-400', 'hover:text-indigo-300', 'underline', 'decoration-indigo-400/30');
+          });
+        }, 400);
       } catch (error) {
-        contentDiv.innerHTML = `<p style="color:red;">❌ Error loading <code>${path}</code>: ${error.message}</p>`;
+        contentDiv.classList.remove('shimmer');
+        contentDiv.innerHTML = `<div class="bg-red-900/20 border border-red-800/30 rounded-xl p-5 text-red-300 flex gap-3"><span>⚠️</span> Could not load <code class="bg-red-900/40 px-1.5 py-0.5 rounded">${path}</code>: ${error.message}</div>`;
       }
     }
 
-    // Load on button click
     loadBtn.addEventListener('click', () => {
-      loadReadme(select.value);
+      loadReadme(selectedValue);
     });
 
-    // Optional: auto-load the first one on page load
-    // loadReadme(select.value);
+    // Optional auto-load first option
+    // loadReadme('Documentation/readme.md');
   </script>
 </body>
 </html>
