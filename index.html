@@ -7,28 +7,14 @@
   <script src="https://cdn.tailwindcss.com"></script>
   <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
   <style>
-    /* Custom animations */
     @keyframes fadeInUp {
       from { opacity: 0; transform: translateY(10px); }
       to   { opacity: 1; transform: translateY(0); }
     }
-    .animate-fade-in-up {
-      animation: fadeInUp 0.3s ease-out forwards;
-    }
-
-    /* Smooth scrollbar for content */
-    .content-scroll::-webkit-scrollbar {
-      width: 5px;
-    }
-    .content-scroll::-webkit-scrollbar-track {
-      background: transparent;
-    }
-    .content-scroll::-webkit-scrollbar-thumb {
-      background: rgba(148, 163, 184, 0.2);
-      border-radius: 3px;
-    }
-
-    /* Mobile menu transition */
+    .animate-fade-in-up { animation: fadeInUp 0.3s ease-out forwards; }
+    .content-scroll::-webkit-scrollbar { width: 5px; }
+    .content-scroll::-webkit-scrollbar-track { background: transparent; }
+    .content-scroll::-webkit-scrollbar-thumb { background: rgba(148,163,184,0.2); border-radius: 3px; }
     .mobile-menu {
       transition: transform 0.3s ease, opacity 0.3s ease;
       transform: translateX(-100%);
@@ -40,19 +26,23 @@
       opacity: 1;
       pointer-events: auto;
     }
-
-    /* Fullscreen mode */
-    .fullscreen .main-content {
-      border-radius: 0 !important;
+    .fullscreen .main-content { border-radius: 0 !important; }
+    .fullscreen .content-scroll { max-height: 100vh !important; }
+    .tour-overlay { background: rgba(0,0,0,0.7); backdrop-filter: blur(4px); }
+    .tour-highlight {
+      box-shadow: 0 0 0 4px rgba(99,102,241,0.6), 0 0 20px rgba(99,102,241,0.3);
+      z-index: 60; position: relative; animation: pulse-glow 2s infinite;
     }
-    .fullscreen .content-scroll {
-      max-height: 100vh !important;
+    @keyframes pulse-glow {
+      0%, 100% { box-shadow: 0 0 0 4px rgba(99,102,241,0.4), 0 0 20px rgba(99,102,241,0.2); }
+      50% { box-shadow: 0 0 0 8px rgba(99,102,241,0.7), 0 0 30px rgba(99,102,241,0.4); }
     }
+    .tour-tooltip { background: rgba(30,41,59,0.95); backdrop-filter: blur(12px); border: 1px solid rgba(255,255,255,0.1); }
   </style>
 </head>
 <body class="bg-slate-950 text-slate-200 font-sans antialiased h-screen flex flex-col overflow-hidden">
 
-  <!-- ========== MOBILE / DESKTOP HEADER ========== -->
+  <!-- Mobile header -->
   <header class="lg:hidden flex items-center justify-between px-4 py-3 bg-slate-900 border-b border-slate-800 sticky top-0 z-50">
     <button id="menuToggle" class="p-2 rounded-lg hover:bg-slate-800 transition text-slate-400 hover:text-white">
       <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -64,20 +54,23 @@
     <h1 class="text-lg font-semibold bg-gradient-to-r from-indigo-400 to-purple-400 bg-clip-text text-transparent">
       📄 Documentation Hub
     </h1>
-    <div class="w-10"></div> <!-- spacer -->
+    <button id="helpBtn" class="p-2 rounded-lg hover:bg-slate-800 transition text-slate-400 hover:text-white" title="Help">
+      <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="12" cy="12" r="10"></circle>
+        <path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"></path>
+        <line x1="12" y1="17" x2="12.01" y2="17"></line>
+      </svg>
+    </button>
   </header>
 
-  <!-- ========== MAIN LAYOUT (sidebar + content) ========== -->
   <div class="flex flex-1 overflow-hidden relative">
-    
-    <!-- SIDEBAR: desktop visible, mobile slide-in -->
+    <!-- Sidebar – FIXED z-index to 50 (was 40) so it appears above mobile header -->
     <aside id="sidebar" class="
       lg:relative lg:translate-x-0 lg:opacity-100 lg:pointer-events-auto
-      fixed inset-y-0 left-0 z-40 w-72 bg-slate-900 border-r border-slate-800
+      fixed inset-y-0 left-0 z-50 w-72 bg-slate-900 border-r border-slate-800
       flex flex-col transition-all duration-300
       mobile-menu
     ">
-      <!-- Sidebar header (hidden on mobile because already in top bar) -->
       <div class="hidden lg:block p-6 border-b border-slate-800">
         <div class="flex items-center gap-3 mb-4">
           <span class="text-2xl">📄</span>
@@ -87,9 +80,7 @@
         </div>
         <p class="text-xs text-slate-500 uppercase tracking-widest font-medium">Select a variant</p>
       </div>
-
-      <!-- File list -->
-      <nav class="flex-1 p-4 space-y-1 overflow-y-auto">
+      <nav class="flex-1 p-4 space-y-1 overflow-y-auto" id="fileList">
         <button class="file-item active w-full text-left px-4 py-3 rounded-lg transition-all duration-200 hover:bg-slate-800 flex items-center gap-3 text-sm"
                 data-file="Documentation/readme.md">
           <span class="text-lg">📘</span> Full Documentation
@@ -99,19 +90,17 @@
           <span class="text-lg">📙</span> Short Documentation
         </button>
       </nav>
-
-      <!-- Sidebar footer -->
       <div class="p-4 border-t border-slate-800 text-xs text-slate-600 text-center hidden lg:block">
         Enterprise Edition v1.0
       </div>
     </aside>
 
-    <!-- Overlay when mobile menu is open -->
+    <!-- Overlay for mobile menu -->
     <div id="menuOverlay" class="fixed inset-0 bg-black/50 z-30 hidden lg:hidden"></div>
 
-    <!-- MAIN CONTENT PANEL -->
+    <!-- Main content -->
     <main class="main-content flex-1 flex flex-col bg-slate-900/50 backdrop-blur-sm border border-slate-800 border-b-0 border-r-0 overflow-hidden">
-      <!-- Desktop top bar (hidden on mobile because we have a separate header) -->
+      <!-- Desktop top bar -->
       <header class="hidden lg:flex items-center justify-between px-6 py-4 border-b border-slate-800 bg-slate-900/80 backdrop-blur-md sticky top-0 z-10">
         <div class="flex items-center gap-3">
           <div class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></div>
@@ -132,12 +121,18 @@
               <polyline points="8 20 4 20 4 16"></polyline>
             </svg>
           </button>
+          <button id="helpBtnDesktop" class="p-2 rounded-lg hover:bg-slate-800 transition text-slate-400 hover:text-white" title="Help">
+            <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="12" cy="12" r="10"></circle>
+              <path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"></path>
+              <line x1="12" y1="17" x2="12.01" y2="17"></line>
+            </svg>
+          </button>
         </div>
       </header>
 
-      <!-- Scrollable content area -->
+      <!-- Scrollable content -->
       <div id="contentArea" class="content-scroll flex-1 overflow-y-auto p-4 md:p-8 lg:p-10">
-        <!-- Placeholder / loading -->
         <div id="placeholder" class="flex flex-col items-center justify-center h-full text-slate-600">
           <span class="text-5xl mb-4">📂</span>
           <p class="text-lg">Select a file from the menu to view documentation</p>
@@ -147,8 +142,18 @@
     </main>
   </div>
 
+  <!-- Tour overlay -->
+  <div id="tourOverlay" class="fixed inset-0 z-50 hidden tour-overlay flex items-center justify-center">
+    <div id="tourTooltip" class="tour-tooltip rounded-2xl p-6 max-w-xs w-full mx-4 shadow-2xl transform transition-all duration-300">
+      <p id="tourText" class="text-slate-200 text-sm mb-4"></p>
+      <div class="flex justify-between items-center">
+        <button id="tourSkip" class="text-xs text-slate-500 hover:text-white transition">Skip</button>
+        <button id="tourNext" class="bg-indigo-600 hover:bg-indigo-500 text-white text-sm font-medium px-4 py-2 rounded-lg transition">Next</button>
+      </div>
+    </div>
+  </div>
+
   <script>
-    // ----- DOM elements -----
     const menuToggle = document.getElementById('menuToggle');
     const sidebar = document.getElementById('sidebar');
     const overlay = document.getElementById('menuOverlay');
@@ -160,11 +165,13 @@
     const fsToggleBtn = document.getElementById('fsToggleBtn');
     const fsIconEnter = document.getElementById('fsIconEnter');
     const fsIconExit = document.getElementById('fsIconExit');
+    const helpBtn = document.getElementById('helpBtn');
+    const helpBtnDesktop = document.getElementById('helpBtnDesktop');
+    const fileList = document.getElementById('fileList');
 
     let currentFile = 'Documentation/readme.md';
     let isFullscreen = false;
 
-    // ----- Mobile menu logic -----
     function closeMenu() {
       sidebar.classList.remove('open');
       overlay.classList.add('hidden');
@@ -174,11 +181,10 @@
       overlay.classList.toggle('hidden');
     });
     overlay.addEventListener('click', closeMenu);
-    // Close menu when a file is selected
+
     fileItems.forEach(item => {
       item.addEventListener('click', () => {
         if (window.innerWidth < 1024) closeMenu();
-        // Update active state
         fileItems.forEach(b => b.classList.remove('active'));
         item.classList.add('active');
         currentFile = item.dataset.file;
@@ -187,14 +193,12 @@
       });
     });
 
-    // ----- Fullscreen logic -----
     fsToggleBtn.addEventListener('click', () => {
       isFullscreen = !isFullscreen;
       document.body.classList.toggle('fullscreen', isFullscreen);
       if (isFullscreen) {
         fsIconEnter.classList.add('hidden');
         fsIconExit.classList.remove('hidden');
-        // Hide mobile header in fullscreen
         document.querySelector('header.lg\\:hidden').style.display = 'none';
       } else {
         fsIconEnter.classList.remove('hidden');
@@ -203,12 +207,9 @@
       }
     });
     document.addEventListener('keydown', (e) => {
-      if (e.key === 'Escape' && isFullscreen) {
-        fsToggleBtn.click();
-      }
+      if (e.key === 'Escape' && isFullscreen) fsToggleBtn.click();
     });
 
-    // ----- Markdown loading & styling -----
     async function loadMarkdown(path) {
       markdownContent.innerHTML = `
         <div class="flex items-center justify-center py-12">
@@ -217,7 +218,6 @@
         </div>`;
       markdownContent.classList.remove('hidden');
       placeholder.classList.add('hidden');
-
       try {
         const response = await fetch(path);
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
@@ -257,7 +257,76 @@
       container.querySelectorAll('hr').forEach(hr => hr.className = 'border-slate-800 my-6');
     }
 
-    // Auto-load the default file on page load
+    const tourOverlay = document.getElementById('tourOverlay');
+    const tourTooltip = document.getElementById('tourTooltip');
+    const tourText = document.getElementById('tourText');
+    const tourNext = document.getElementById('tourNext');
+    const tourSkip = document.getElementById('tourSkip');
+    let currentStep = -1;
+    let highlightedElement = null;
+
+    const steps = [
+      {
+        text: "Select a documentation file here. Tap <b>Full</b> or <b>Short</b> to load it instantly.",
+        getElement: () => window.innerWidth >= 1024 ? fileList : menuToggle,
+        position: () => {
+          const el = steps[0].getElement();
+          const rect = el.getBoundingClientRect();
+          return { top: rect.bottom + 16 + 'px', left: Math.min(rect.left, window.innerWidth - 320) + 'px' };
+        }
+      },
+      {
+        text: "Click this button to enter full‑screen reading mode. Press <b>Esc</b> to exit.",
+        getElement: () => fsToggleBtn,
+        position: () => {
+          const rect = fsToggleBtn.getBoundingClientRect();
+          return { top: rect.bottom + 16 + 'px', left: Math.min(rect.left, window.innerWidth - 320) + 'px' };
+        }
+      },
+      {
+        text: "Here's your loaded documentation. <b>Scroll down</b> to read the entire file. Enjoy!",
+        getElement: () => contentArea,
+        position: () => {
+          const rect = contentArea.getBoundingClientRect();
+          return { top: rect.top + 80 + 'px', left: rect.left + 40 + 'px' };
+        }
+      }
+    ];
+
+    function showStep(stepIndex) {
+      if (stepIndex >= steps.length) { endTour(); return; }
+      currentStep = stepIndex;
+      const step = steps[stepIndex];
+      const element = step.getElement();
+      if (!element) return;
+      if (highlightedElement) highlightedElement.classList.remove('tour-highlight');
+      element.classList.add('tour-highlight');
+      highlightedElement = element;
+      const pos = step.position();
+      tourTooltip.style.position = 'fixed';
+      tourTooltip.style.top = pos.top;
+      tourTooltip.style.left = pos.left;
+      tourTooltip.style.right = 'auto';
+      tourTooltip.style.bottom = 'auto';
+      tourText.innerHTML = step.text;
+      tourNext.textContent = stepIndex === steps.length - 1 ? 'Finish' : 'Next';
+      tourOverlay.classList.remove('hidden');
+    }
+
+    function endTour() {
+      tourOverlay.classList.add('hidden');
+      if (highlightedElement) { highlightedElement.classList.remove('tour-highlight'); highlightedElement = null; }
+      currentStep = -1;
+      localStorage.setItem('tourSeen', 'true');
+    }
+
+    tourNext.addEventListener('click', () => showStep(currentStep + 1));
+    tourSkip.addEventListener('click', endTour);
+    function startTour() { currentStep = -1; showStep(0); }
+    helpBtn.addEventListener('click', startTour);
+    helpBtnDesktop.addEventListener('click', startTour);
+    if (!localStorage.getItem('tourSeen') && window.innerWidth >= 1024) setTimeout(startTour, 1000);
+
     loadMarkdown(currentFile);
   </script>
 </body>
