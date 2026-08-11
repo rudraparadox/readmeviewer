@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Documentation Hub – Enterprise</title>
+  <title>README Viewer – Enterprise</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
   <style>
@@ -54,7 +54,6 @@
       color: #e2e8f0;
       pointer-events: auto;
     }
-    /* Arrow pointer */
     .tour-tooltip::before {
       content: '';
       position: absolute;
@@ -82,8 +81,9 @@
         <line x1="3" y1="18" x2="21" y2="18"></line>
       </svg>
     </button>
-    <h1 class="text-lg font-semibold bg-gradient-to-r from-indigo-400 to-purple-400 bg-clip-text text-transparent">
-      📄 Documentation Hub
+    <!-- Dynamic header: shows current document name -->
+    <h1 id="mobileFileLabel" class="text-lg font-semibold bg-gradient-to-r from-indigo-400 to-purple-400 bg-clip-text text-transparent truncate max-w-[200px]">
+      📄 Full Documentation
     </h1>
     <button id="helpBtn" class="p-2 rounded-lg hover:bg-slate-800 transition text-slate-400 hover:text-white" title="Help">
       <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -105,8 +105,8 @@
       <div class="hidden lg:block p-6 border-b border-slate-800">
         <div class="flex items-center gap-3 mb-4">
           <span class="text-2xl">📄</span>
-          <h1 class="text-xl font-semibold bg-gradient-to-r from-indigo-400 to-purple-400 bg-clip-text text-transparent">
-            Documentation Hub
+          <h1 id="desktopFileLabel" class="text-xl font-semibold bg-gradient-to-r from-indigo-400 to-purple-400 bg-clip-text text-transparent">
+            Full Documentation
           </h1>
         </div>
         <p class="text-xs text-slate-500 uppercase tracking-widest font-medium">Select a variant</p>
@@ -119,6 +119,11 @@
         <button class="file-item w-full text-left px-4 py-3 rounded-lg transition-all duration-200 hover:bg-slate-800 flex items-center gap-3 text-sm"
                 data-file="Documentation-Short/readme.md">
           <span class="text-lg">📙</span> Short Documentation
+        </button>
+        <!-- NEW: Developer section -->
+        <button class="file-item w-full text-left px-4 py-3 rounded-lg transition-all duration-200 hover:bg-slate-800 flex items-center gap-3 text-sm"
+                data-file="Developer/developer.md">
+          <span class="text-lg">🛠️</span> Developer Notes
         </button>
       </nav>
       <div class="p-4 border-t border-slate-800 text-xs text-slate-600 text-center hidden lg:block">
@@ -187,6 +192,8 @@
     const markdownContent = document.getElementById('markdownContent');
     const placeholder = document.getElementById('placeholder');
     const currentFileLabel = document.getElementById('currentFileLabel');
+    const mobileFileLabel = document.getElementById('mobileFileLabel');
+    const desktopFileLabel = document.getElementById('desktopFileLabel');
     const contentArea = document.getElementById('contentArea');
     const fsToggleBtn = document.getElementById('fsToggleBtn');
     const fsIconEnter = document.getElementById('fsIconEnter');
@@ -200,6 +207,7 @@
     const tourSkip = document.getElementById('tourSkip');
 
     let currentFile = 'Documentation/readme.md';
+    let currentFileName = '📄 Full Documentation'; // for header updates
     let isFullscreen = false;
     let currentStep = -1;
     let highlightedElement = null;
@@ -214,13 +222,21 @@
     });
     overlay.addEventListener('click', closeMenu);
 
+    // Update all header labels when a file is selected
+    function updateHeaderLabels(label) {
+      if (currentFileLabel) currentFileLabel.textContent = label;
+      if (mobileFileLabel) mobileFileLabel.textContent = label;
+      if (desktopFileLabel) desktopFileLabel.textContent = label;
+    }
+
     fileItems.forEach(item => {
       item.addEventListener('click', () => {
         if (window.innerWidth < 1024) closeMenu();
         fileItems.forEach(b => b.classList.remove('active'));
         item.classList.add('active');
         currentFile = item.dataset.file;
-        if (currentFileLabel) currentFileLabel.textContent = item.innerText.trim();
+        const label = item.innerText.trim();
+        updateHeaderLabels(label);
         loadMarkdown(currentFile);
       });
     });
@@ -289,10 +305,10 @@
       container.querySelectorAll('hr').forEach(hr => hr.className = 'border-slate-800 my-6');
     }
 
-    // ─── TOUR (mobile + desktop spotlight) ────────────
+    // ─── TOUR (unchanged) ────────────────────────────
     const steps = [
       {
-        text: "Select a documentation file here. Tap <b>Full</b> or <b>Short</b> to load it.",
+        text: "Select a documentation file here. Tap any item to load it instantly.",
         getElement: () => window.innerWidth >= 1024 ? fileList : menuToggle,
       },
       {
@@ -317,13 +333,11 @@
       let top, left;
       removeArrowClasses();
 
-      // Determine best placement (bottom/right/top/left) avoiding overlap
       const spaceBottom = window.innerHeight - rect.bottom - margin;
       const spaceTop = rect.top - margin;
       const spaceRight = window.innerWidth - rect.right - margin;
       const spaceLeft = rect.left - margin;
 
-      // Prefer bottom if enough space, else top, else right/left
       if (spaceBottom >= tooltipHeight + margin) {
         top = rect.bottom + margin;
         left = rect.left + rect.width/2 - tooltipWidth/2;
@@ -341,12 +355,10 @@
         left = rect.left - tooltipWidth - margin;
         tourTooltip.classList.add('tooltip-arrow-right');
       } else {
-        // Fallback: center on screen
         top = Math.max(margin, (window.innerHeight - tooltipHeight) / 2);
         left = Math.max(margin, (window.innerWidth - tooltipWidth) / 2);
       }
 
-      // Clamp to keep tooltip fully visible
       left = Math.min(Math.max(left, margin), window.innerWidth - tooltipWidth - margin);
       top = Math.min(Math.max(top, margin), window.innerHeight - tooltipHeight - margin);
 
@@ -361,7 +373,6 @@
       const element = step.getElement();
       if (!element) return;
 
-      // Remove previous highlight
       if (highlightedElement) highlightedElement.classList.remove('tour-highlight');
       element.classList.add('tour-highlight');
       highlightedElement = element;
@@ -370,7 +381,6 @@
       tourNext.textContent = stepIndex === steps.length - 1 ? 'Finish' : 'Next';
 
       tourTooltip.classList.remove('hidden');
-      // Wait for layout to get accurate tooltip dimensions
       requestAnimationFrame(() => {
         positionTooltip(element);
       });
@@ -389,7 +399,6 @@
     tourNext.addEventListener('click', () => showStep(currentStep + 1));
     tourSkip.addEventListener('click', endTour);
 
-    // Reposition on resize/scroll
     window.addEventListener('resize', () => {
       if (currentStep !== -1 && highlightedElement) positionTooltip(highlightedElement);
     });
@@ -404,11 +413,12 @@
     helpBtn.addEventListener('click', startTour);
     helpBtnDesktop.addEventListener('click', startTour);
 
-    // Auto-start tour on first visit (any device)
     if (!localStorage.getItem('tourSeen')) {
       setTimeout(startTour, 800);
     }
 
+    // Load default file and set initial header
+    updateHeaderLabels('📄 Full Documentation');
     loadMarkdown(currentFile);
   </script>
 </body>
