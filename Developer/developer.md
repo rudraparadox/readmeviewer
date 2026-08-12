@@ -418,3 +418,152 @@ projects.
 
 *Full technical deep-dive: `DOCUMENTATION.md` · Plain-English overview: `PROJECT_OVERVIEW.md` ·
 Run + demo script: `README.md`*
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# Tech Stack & Libraries
+
+SBOM-Gen is a polyglot SBOM generation and vulnerability scanning tool. It combines a
+Python/FastAPI backend with a React dashboard, packaged as a single desktop exe.
+
+---
+
+## 1. Backend — Python + FastAPI
+
+The core scanning engine and REST API live in `backend/`.
+
+| Library | Purpose |
+|---|---|
+| **FastAPI** | REST API framework — `/api/scan`, polling, CycloneDX/SPDX/PDF export endpoints. Ships with **Pydantic** for the shared `Component`, `Vulnerability`, `ScanResult` models. |
+| **Uvicorn** | ASGI server that runs the FastAPI app (dev, and embedded inside the desktop exe). |
+| **python-multipart** | Parses the drag-and-drop zip file uploads. |
+| **requests** | HTTP client for the live **OSV API** (vulnerability lookups), PyPI/npm registry resolution, and ClearlyDefined license enrichment. |
+
+### Ecosystem parsers
+Most lock-file parsing (`package-lock.json`, `yarn.lock`, `Cargo.lock`, `composer.lock`,
+`Gemfile.lock`, `packages.lock.json`, `pom.xml`, `go.mod`+`go.sum`, Gradle, Conan, vcpkg, conda,
+Podfile, dpkg) is done with **pure Python stdlib** (`json`, `re`, `ast`, `xml.etree`) — no heavy
+third-party dependencies.
+
+| Library | Purpose |
+|---|---|
+| **cyclonedx-python-lib** | Official library for standards-compliant **CycloneDX 1.5** output — components, purls, hashes, licenses, dependency relationships and embedded vulnerabilities. Includes `packageurl` for package-URL generation. |
+| **pefile** | Reads Windows **PE** exe/dll import tables to list linked DLLs in binary artifacts. |
+| — | Linux **ELF** `DT_NEEDED` parsing and wheel/JAR metadata extraction are hand-implemented. |
+| **reportlab** | Generates the A4 **PDF** executive report. |
+| **packaging** | Semver/version-range parsing used for vulnerability range matching. |
+| **PyJWT** | JSON Web Tokens for login sessions (multi-tenant orgs, roles, API tokens). |
+| **bcrypt** | Password hashing for the auth store. |
+| **cryptography** | Ed25519 signing/verification of SBOM manifests. |
+| **pywebview** | Opens the packaged exe as a native desktop window (Edge Chromium backend) with a bridge to export files to Downloads. |
+| **sqlite3** (stdlib) | Persistence for scan jobs/history, the OSV result cache, Maven metadata cache, auth, policy and audit log — no database server needed. |
+| **cose** | Optional COSE verification for Microsoft-style signed catalogs. |
+
+### Vulnerability data
+- **Bundled offline dataset** — `seed_data.json` with 830+ curated advisories across 8
+  ecosystems (this is what makes fully offline scans work).
+- **Live OSV API** — checked per component through a bounded thread pool, cached in SQLite.
+
+### Standard-library highlights
+`ast` (Python import analysis for reachability), `hashlib` (SHA-1/256 file hashes),
+`concurrent.futures` + `threading` (parallel hashing/parsing, background scan jobs), `zipfile`
+(zip extraction with zip-slip protection), `subprocess` (shallow `git clone` for GitHub URLs,
+docker CLI fallback), `ctypes`/`winreg` (GPU detection + registry tweaks on Windows).
+
+---
+
+## 2. Frontend — React + Vite
+
+The web dashboard lives in `frontend/` and is served directly by FastAPI after `npm run build`.
+
+| Library | Purpose |
+|---|---|
+| **React 18** + **react-dom** | UI framework — SPA dashboard. |
+| **Vite 5** | Build tool and dev server (hot reload in dev, static bundle for production). |
+| **@vitejs/plugin-react** | React JSX support in Vite. |
+| **d3-hierarchy** | Renders the interactive **dependency graph** — vulnerable nodes glow red, attack paths highlighted, zoom/pan/collapse. |
+| **lucide-react** | Icon set for the dashboard UI. |
+| **@fontsource/inter**, **@fontsource/jetbrains-mono** | Inter UI font + JetBrains Mono for code/hash display. |
+
+### Dev-only
+| Library | Purpose |
+|---|---|
+| **puppeteer-core** | UI check/screenshot automation (development only, not shipped). |
+
+---
+
+## 3. CLI & Packaging
+
+| Tool | Purpose |
+|---|---|
+| **`sbomgen` CLI** | Python `argparse`-based command-line tool (`backend/sbomgen.py`). Scans folders/zips/GitHub URLs, emits `json`, `cyclonedx`, `spdx`, `spdx30`, `html`, `pdf`, and gates CI with `--fail-on <severity>` (exit code 2 = build failure). |
+| **PyInstaller** | Builds the single-file executables — `SBOM-Gen.spec` (windowed desktop app with icon) and `SBOM-Gen-CLI.spec` (console CLI). |
+| **Inno Setup** | `installer.iss` — Windows installer that bundles the built exe. |
+
+---
+
+## 4. Testing & Tooling
+
+| Tool | Purpose |
+|---|---|
+| **pytest** + FastAPI **TestClient** | E2E API tests, severity/regression tests, binary-artifact tests, CLI subprocess tests (`backend/tests/`). |
+| **pip** (`requirements.txt`) / **npm** (`package-lock.json`) | Dependency management for backend and frontend. |
+| **uvicorn / vite** | Local dev loop: backend on `:8000`, frontend on `:5173` (proxying `/api`). |
+
+---
+
+## 5. Tech Stack at a Glance
+
+| Layer | Technology |
+|---|---|
+| Backend API | Python · FastAPI · Uvicorn · Pydantic |
+| Frontend | React 18 · Vite 5 |
+| Dependency graph | d3-hierarchy (custom SVG) |
+| SBOM output | CycloneDX 1.5 (cyclonedx-python-lib) · SPDX 2.3/3.0 (hand-built) |
+| Vulnerability data | Bundled offline dataset + live OSV API · SQLite cache |
+| PDF reports | reportlab |
+| Binary parsing | pefile (PE) + hand-rolled ELF/wheel/JAR parsing |
+| Auth | PyJWT + bcrypt |
+| Persistence | SQLite (stdlib) |
+| Desktop packaging | pywebview · PyInstaller · Inno Setup |
+| CI/CD | `sbomgen` CLI with `--fail-on` gating |
