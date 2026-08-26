@@ -1,958 +1,564 @@
-# SBOM-Gen — Complete Project Documentation
+# PureOS vs Linux: Real Hardware Boot Gap Analysis
 
-**SIH 2024 Problem Statement 1449 · NTRO (National Technical Research Organisation)**
-
-> This document explains the entire tool — what it does, how it works internally, and how to
-> present it. Each section has two parts: **Plain English** (say this out loud to judges) and
-> **Technical details** (to back it up / answer deep questions).
+> **Target Hardware**: Lenovo LOQ (Intel, 8+ GB RAM, xHCI USB 3.0, UEFI)
+> **Symptom**: PureOS boots fine in QEMU but crashes/freezes on the real Lenovo LOQ.
+> **Serial Log**: [uefi_serial.log](file:///d:/1os-copy/backup/1os/uefi_serial.log) — captured from QEMU (real LOQ has no serial port, so crashes are silent)
 
 ---
 
-## Table of Contents
+## Executive Summary — Ranked Crash Causes
 
-1. [What is this tool? (30-second pitch)](#1-what-is-this-tool)
-2. [The problem we are solving](#2-the-problem-we-are-solving)
-3. [How it works — the whole story in plain words](#3-how-it-works--the-whole-story-in-plain-words)
-4. [Tech stack at a glance](#4-tech-stack-at-a-glance)
-5. [System architecture](#5-system-architecture)
-6. [Deep dive — module by module](#6-deep-dive--module-by-module)
-   - 6.1 Input handling (zip / folder / GitHub / Docker)
-   - 6.2 Ecosystem detection & lock-file parsing
-   - 6.3 Binary artifact analysis
-   - 6.4 Source / import analysis (reachability)
-   - 6.5 Vulnerability engine
-   - 6.6 Context analyzer (red flags + remediation)
-   - 6.7 SBOM generation (CycloneDX / SPDX)
-   - 6.8 Reports (HTML & PDF)
-   - 6.9 Policy engine (CI/CD gating)
-   - 6.10 The `sbomgen` CLI
-   - 6.11 Auth & multi-tenancy
-   - 6.12 Frontend dashboard
-7. [Key design decisions](#7-key-design-decisions)
-8. [How to run it](#8-how-to-run-it)
-9. [Demo script for judges (7-minute live walkthrough)](#9-demo-script-for-judges)
-10. [Likely judge questions & suggested answers](#10-likely-judge-questions--suggested-answers)
-11. [Glossary](#11-glossary)
+| Rank | Subsystem | Severity | Issue |
+|------|-----------|----------|-------|
+| **🔴 1** | **`kmalloc_ap` physical address calculation** | **CRITICAL** | Hardcoded `- 0xC0000000` assumes kernel phys base = 0, but bootloader places kernel at 0x1800000+. Every page table allocation gets a **wrong physical address**. |
+| **🔴 2** | **Paging: blind 1GB identity map** | **CRITICAL** | Maps all of 0–1GB as writable RAM including MMIO holes, ACPI regions, and reserved firmware memory. Writes to these regions corrupt firmware state. |
+| **🔴 3** | **No PAT/cache control on MMIO** | **HIGH** | xHCI MMIO mapped without Write-Combining or Uncacheable attributes at the page table level. Cached MMIO reads return stale data; posted writes reorder. |
+| **🟠 4** | **xHCI dynamic mapping at 0x200000000** | **HIGH** | Mapping works in QEMU but relies on the paging walker using `kmalloc_ap` (broken, see #1). The new PML4/PDPT/PD entries may point at wrong physical frames. |
+| **🟠 5** | **PCI: Bus 0 only scan** | **MEDIUM** | Lenovo LOQ routes xHCI to Bus 0, but NVMe, GPU, and other bridges live on higher buses. Missing devices = missing MMIO reservations. |
+| **🟡 6** | **ACPI: missing `_OSC`, `_REG`, `_INI`** | **MEDIUM** | `_OSC` fails with `AE_NOT_FOUND`. Linux evaluates dozens of ACPI methods that configure SMM behavior; PureOS skips them. |
+| **🟡 7** | **Interrupt controller: IOAPIC + stale PIC** | **LOW-MED** | IOAPIC routes look correct but `pic_init()` runs before `lapic_init()` — window for stale PIC interrupts hitting wrong handlers. |
+| **⚪ 8** | **ExitBootServices handling** | **LOW** | Retry loop is correct. Memory map buffer forced below 1GB. This is fine. |
 
 ---
 
-## 1. What is this tool?
+## 1. UEFI Boot → Kernel Handoff
 
-### Plain English
+### What Linux Does
 
-> Imagine software is like a recipe. When a company builds software, it usually uses **hundreds
-> of ready-made ingredients** — these are called "libraries" or "dependencies" (for example, a
-> JavaScript project might use a library called `lodash`, a Python project might use `requests`).
->
-> This tool is like a **smart nutrition label + expiry checker** for software. You hand it your
-> project (a zip file, a folder, or a GitHub link) and it automatically:
->
-> 1. **Reads the recipe** — lists every ingredient (library) with its **exact version**.
-> 2. **Checks the expiry date** — checks every ingredient against a database of known
->    **vulnerabilities** (security holes) and marks the dangerous ones in **red**.
-> 3. **Tells you exactly how to fix it** — gives you the precise command to upgrade the bad
->    ingredient.
-> 4. **Prints the official "nutrition label"** — exports it in the government-standard SBOM
->    formats (CycloneDX and SPDX) that security teams and regulations require.
->
-> And the best part — **it works fully offline**, which is critical for sensitive government
-> (NTRO) environments that cannot access the internet.
+Linux's EFI stub (`drivers/firmware/efi/libstub/x86-stub.c`) performs:
 
-### Technical (one-liner)
+1. **`ExitBootServices()` with retry** — gets memory map, calls EBS, if stale key → re-get map and retry (exactly like PureOS).
+2. **Preserves UEFI memory map** in a `struct efi_boot_memmap` for later use by the kernel's memory manager.
+3. **Does NOT load a new GDT before jumping to the kernel** — the kernel's `startup_64` in `head_64.S` loads its own GDT/IDT from the decompressed image.
+4. **Sets up a trampoline identity map** that covers both the EFI stub code AND the kernel entry point, so the CR3 switch is safe.
+5. **Calls `efi_relocate_kernel()`** if the kernel is not loaded at the expected physical address — it adjusts all relocations.
 
-A web-based, polyglot Software Bill of Materials (SBOM) generator + vulnerability scanner that
-parses lock files and binary artifacts, cross-references components against a bundled offline
-CVE dataset plus the live OSV API, flags anomalies, computes remediation, and emits
-CycloneDX 1.5 / SPDX 2.3 / SPDX 3.0 SBOMs, HTML and PDF reports — with a web dashboard and a
-CI/CD CLI.
+### What PureOS Does
 
----
+[boot.c](file:///d:/1os-copy/backup/1os/src/boot/uefi/boot.c):
 
-## 2. The problem we are solving
+1. **`ExitBootServices()` retry** (lines 642–655) ✅ Correct — retries up to 4 times with fresh map key.
+2. **Memory map buffer** allocated at fixed low addresses (lines 562–581) ✅ Good — ensures it's below 1GB.
+3. **Loads GDT immediately after EBS** (line 660) ✅ Correct — the GDT array is in the .data of BOOTX64.EFI.
+4. **Sets segment registers** (lines 663–670) ✅ Correct.
+5. **Switches CR3 and jumps** (lines 675–679) ⚠️ Risky but works because `MapImageRegion()` maps the bootloader's own code.
 
-### Plain English
+### Gaps
 
-- Modern software is rarely written from scratch — **80–90% of a modern application is
-  third-party code** (open-source libraries).
-- These libraries have security holes (CVEs) discovered over time. If you don't know **exactly
-  which version** of which library you are using, you cannot know if you are vulnerable.
-- This became a legal/regulatory requirement: governments and big organizations now **require**
-  every piece of software to ship with an SBOM — a machine-readable "ingredients list".
-- NTRO's problem statement adds a special twist: the tool must work **offline**, because
-  classified/intelligence environments cannot talk to public vulnerability databases over the
-  internet.
+| Area | PureOS | Linux | Risk |
+|------|--------|-------|------|
+| **IDT after EBS** | No IDT loaded — any exception → triple fault | Linux loads IDT in `startup_64` before enabling interrupts | 🟡 Low — interrupts are CLI'd |
+| **Kernel relocation** | Kernel loaded at first available `0x100000 + i*0x200000` slot; if that's not 0x100000, the higher-half mapping compensates | Linux's `efi_relocate_kernel()` handles this properly with relocation fixups | 🟢 OK for PureOS |
+| **Stack after CR3 switch** | Jumps to `kernelAddr` which is `pure_kernel.asm` entry — sets its own stack immediately | Linux `startup_64` sets stack from linker-defined symbol | 🟢 OK |
 
-### The criteria the judges will score on
-
-| Criterion | What our tool does |
-|---|---|
-| **Automation** | Drag a `.zip` or paste a GitHub URL → full SBOM + vulnerability report in one click. |
-| **Granularity** | Lock-file based parsing → exact versions, transitive dependencies, integrity hashes, direct/transitive/dev flags. 8+ ecosystems. |
-| **Accuracy** | Parses *resolved lock files* (ground truth of what was installed), not guesswork from source code. |
-| **Red-flag anomalies** | Bundled 836-record CVE dataset + live OSV lookup; typosquatting, shadow deps, deprecated packages, unpinned versions, license conflicts. |
-| **Context** | CVE details, CVSS score & vector, CISA Known-Exploited / malicious markers, **reachability** (is it actually used in your code?), and the exact fix command. |
-| **Ease of use** | Web dashboard with interactive graph, filters, one-click CycloneDX/SPDX/PDF export, and a CLI for pipelines. |
-| **Offline / in-house** | Bundled offline dataset → full scan with zero internet. |
+> [!NOTE]
+> The UEFI boot → kernel handoff is **not the crash point**. The serial log shows `[K1] KERNEL MAIN REACHED` which means the jump succeeded.
 
 ---
 
-## 3. How it works — the whole story in plain words
+## 2. Early Memory / Paging — 🔴 CRITICAL BUGS
 
-> Follow one scan from start to finish. This is your "elevator pitch" of the pipeline.
+### 2A. The `kmalloc_ap` Physical Address Bug
 
-**Step 0 — You give it something to scan.**
-You can drop a **zip file**, type a **server folder path**, paste a **GitHub URL**, or even a
-**Docker image name**. The tool accepts all four.
+[heap.c:246–263](file:///d:/1os-copy/backup/1os/src/kernel/heap.c#L246-L263):
 
-**Step 1 — It finds the "receipts" (lock files).**
-Modern package managers leave behind *lock files* — files that record exactly what was
-installed and which version. Examples: `package-lock.json` (Node.js), `requirements.txt` /
-`poetry.lock` (Python), `pom.xml` (Java), `go.mod` (Go), `Cargo.lock` (Rust), `composer.lock`
-(PHP), `Gemfile.lock` (Ruby), `packages.lock.json` (.NET), `build.gradle` (Android/Java).
-The tool walks the whole project and detects **every** ecosystem present at once
-(polyglot support). If no lock file exists, it falls back to reading the manifests or analysing
-the source code.
-
-**Step 2 — It builds the "ingredient list" (components).**
-For each ecosystem it parses the lock file and creates a *component* for every library:
-its **name**, **exact version**, **package URL (purl)**, **integrity hashes** (so the file can be
-verified byte-for-byte), and whether it is a **direct** dependency (you asked for it) or a
-**transitive** dependency (it came bundled inside something else). It also records the
-**dependency edges** — "A depends on B, B depends on C" — so you can draw the full tree.
-
-**Step 3 — It also inspects "packaged goods" (binary artifacts).**
-If the project contains already-built files — Python wheels, Java JARs, Windows `.exe`/`.dll`,
-Linux `.so` — it extracts their metadata too, so shipped binaries land in the SBOM even when you
-don't have the source.
-
-**Step 4 — It looks inside your actual code.**
-It reads your source code's **import statements** (`import requests`, `require('lodash')`,
-`#include <openssl/ssl.h>`, `import com.fasterxml.jackson...`). This powers two smart features:
-- **Reachability** — "is this vulnerable library *actually used* in my code, or just sitting in
-  the dependency tree?"
-- **Shadow dependencies** — libraries imported in code but not declared in any manifest
-  (a red flag — could be a hidden/hijacked package).
-
-**Step 5 — It checks every ingredient against known vulnerabilities.**
-Every `name@version` is looked up in:
-- a **bundled offline dataset** of 836 curated advisories across 8 ecosystems (works with no
-  internet), and
-- the **live OSV (Open Source Vulnerabilities) API** (a Google-backed public database), with a
-  local SQLite cache so repeat scans are instant and offline-friendly.
-
-**Step 6 — It adds context and red flags.**
-For every vulnerability found it attaches: CVE/ID, **CVSS score** (0–10) and severity
-(CRITICAL/HIGH/MEDIUM/LOW), **CISA Known-Exploited** and **malicious-package** markers, whether
-it is **reachable from your code**, and the **exact upgrade command** to fix it.
-It also flags *anomalies*: typosquatted package names, deprecated/yanked versions, unpinned
-versions, unmaintained packages, license conflicts (e.g., using GPL inside a commercial product),
-and version drift (the same package at multiple versions).
-
-**Step 7 — It generates the official SBOM + reports.**
-It emits standards-compliant **CycloneDX 1.5**, **SPDX 2.3** and **SPDX 3.0** JSON — with the
-vulnerabilities, hashes, and dependency relationships **embedded inside**, so the SBOM is
-consumable end-to-end. It also generates a self-contained **HTML report** and a **PDF report**
-with an overall "Supply-Chain Health Score".
-
-**Step 8 — You see it in a beautiful dashboard.**
-The web UI shows summary cards, an **interactive dependency graph** (vulnerable nodes glow red,
-attack paths highlighted), a filterable component table, an anomaly feed, a code browser with
-per-line vulnerability markers, and one-click export/download buttons.
-
-**Step 9 — (Optional) You automate it.**
-The same engine runs from a command line (`sbomgen`), so CI/CD pipelines can scan on every
-commit and **fail the build** if a critical vulnerability appears.
-
----
-
-## 4. Tech stack at a glance
-
-| Layer | Technology | Why |
-|---|---|---|
-| Backend API | **Python · FastAPI** | Fast async REST API, Pydantic validation, easy background threading |
-| Frontend | **React + Vite** | Single-page dashboard, fast builds |
-| Dependency graph | **d3-hierarchy** (custom SVG) | Interactive tree/attack-path visualization |
-| CycloneDX output | **cyclonedx-python-lib** | Official library — no hand-rolled schema, standards-compliant |
-| SPDX output | Hand-built (JSON) | Full control over relationships/vulnerabilities embedding |
-| Persistence | **SQLite** | Job store, OSV cache, Maven cache, auth, audit log — no DB server needed |
-| Vulnerability data | **OSV API** (live) + **bundled seed_data.json** (offline) | Both worlds: freshness + air-gapped operation |
-| PDF reports | **reportlab** | A4, print-ready executive reports |
-| Packaging | **PyInstaller** | Single `.exe` — no Python/Node install needed |
-| Auth | **JWT + bcrypt** | Multi-tenant organisations, roles, API tokens, audit log |
-
----
-
-## 5. System architecture
-
-```
-┌───────────────────────────────────────────────────────────────┐
-│               React Dashboard  (frontend/, Vite)              │
-│  Uploader · Summary cards · Dependency graph · Table          │
-│  Anomalies · Code browser · Licenses · Binaries               │
-│  Context panel (CVSS + fix command) · Export buttons          │
-└────────────────────────────┬──────────────────────────────────┘
-                             │ REST (same-origin /api)
-┌────────────────────────────▼──────────────────────────────────┐
-│                  FastAPI  (backend/app/main.py)               │
-│   POST /api/scan  (zip | path | github_url | docker) → job_id │
-│   GET  /api/scan/{id}                 (poll status + result)  │
-│   GET  /api/scan/{id}/cyclonedx|spdx|spdx30|report|report.pdf │
-│   GET  /api/scan/{id}/tree|file|validate|diff  ...            │
-│   Background worker threads (daemon), SQLite job store        │
-└────────────────────────────┬──────────────────────────────────┘
-         ┌───────────────────┼───────────────────┐
-         ▼                   ▼                   ▼
-   ┌───────────┐      ┌────────────┐      ┌──────────────┐
-   │ scanner/  │      │  vuln/     │      │  context/    │
-   │ detect    │      │  osv.py    │      │  analyzer.py │
-   │ 18 parsers│      │  cache.py  │      │  severity    │
-   │ runner.py │      │  seed_data │      │  remediation │
-   │ ast_      │      │  (836 CVEs)│      │  reachability│
-   │ scanner   │      │  SQLite    │      │  anomalies   │
-   │ binary_   │      │  cache     │      │  licenses    │
-   │ parser    │      └────────────┘      └──────────────┘
-   └───────────┘                 ▼
-                         ┌──────────────┐
-                         │  sbom/       │  CycloneDX 1.5
-                         │  generator   │  SPDX 2.3 / 3.0
-                         │  hashing.py  │  file hashes
-                         └──────────────┘
+```c
+void *kmalloc_ap(size_t size, uint32_t *phys) {
+    void *ptr = kmalloc(size + 4096);
+    uint32_t addr = (uint32_t)(uintptr_t)ptr;
+    uint32_t aligned = (addr + 0xFFF) & ~0xFFF;
+    if (phys) {
+        *phys = aligned - 0xC0000000;  // ⚠️ HARDCODED OFFSET
+    }
+    return (void *)(uintptr_t)aligned;
+}
 ```
 
-### Data flow (one sentence)
+**The problem**: This assumes the kernel's virtual base `0xC0000000` maps to physical address `0x0`. But the bootloader maps `0xC0000000 → kernel_phys_base`, and `kernel_phys_base` is determined at boot time. The serial log shows:
 
-Upload → detect ecosystems → parse lock files → build `Component` list (name, exact version,
-purl, hashes, direct/transitive, children/parents) → AST import analysis → vulnerability
-enrichment (offline seed + live OSV) → anomaly & license checks → generate CycloneDX / SPDX /
-SPDX-3.0 → store result in SQLite keyed by job id → UI polls until complete.
-
----
-
-## 6. Deep dive — module by module
-
-> File paths are relative to `backend/app/`. For each module: first the **Plain English**, then
-> the **Technical details** you can quote when judges probe deeper.
-
-### 6.1 Input handling — how a scan is started
-
-**Files:** `api/routes.py`, `scanner/runner.py`, `scanner/docker_parser.py`
-
-#### Plain English
-
-You have four ways to feed the tool, and it figures out which one you meant:
-
-1. **Zip file** — drag & drop any project zip. It safely extracts it into a temporary folder
-   (guarding against "zip-slip" path-traversal attacks) and scans it.
-2. **Server folder path** — type a folder on the machine where the tool runs.
-3. **GitHub URL** — paste `https://github.com/owner/repo`; the tool does a shallow `git clone`
-   and scans the downloaded copy.
-4. **Docker image** — pull/extract a container image and scan the OS packages + language
-   libraries inside it.
-5. **Single binary** — if the uploaded file is not a zip but a compiled artifact (`.whl`,
-   `.jar`, `.exe`, `.dll`, `.so`), it scans the binary directly.
-
-#### Technical details
-
-- `POST /api/scan` accepts `multipart/form-data` with `file`, `path`, `github_url`, or
-  `docker_images`, plus `offline_only` and `fetch_licenses` flags. Precedence:
-  docker → github → path → file.
-- The scan runs in a **daemon thread** so a big repository (2,000+ dependencies) doesn't block
-  the API. The client polls `GET /api/scan/{id}` until `status` becomes `complete` or `error`.
-- Job statuses: `pending → scanning → complete | error`.
-- Results are persisted to SQLite (`jobs.db`, `%LOCALAPPDATA%\sih1449\`) with `INSERT OR REPLACE`,
-  so **scan history survives a restart**.
-- Zip extraction (`_extract_zip`) resolves every member path and refuses anything that escapes
-  the destination directory (zip-slip protection).
-- GitHub clones use `git clone --depth 1 --quiet` with a 120-second timeout.
-- Uploaded projects are stored (`projects.py`) so the **code browser** (with per-line
-  vulnerability flags) keeps working after a restart.
-
----
-
-### 6.2 Ecosystem detection & lock-file parsing
-
-**Files:** `scanner/node.py` (detection), `scanner/runner.py` (dispatch), plus one parser per
-ecosystem.
-
-#### Plain English
-
-The tool first **walks the whole folder** looking for "signatures" — known lock-file names.
-Whatever it finds tells it which package managers the project uses. A project can use several at
-once (e.g., a Python backend + a JavaScript frontend) and the tool scans **all of them in
-parallel**.
-
-It then picks the **most authoritative file** per ecosystem. Lock files are preferred over plain
-manifests because lock files contain **exact, resolved versions** — the ground truth of what
-would actually be installed.
-
-#### The detection table (how the tool knows which ecosystem is which)
-
-| Lock file / manifest | Ecosystem |
-|---|---|
-| `package-lock.json`, `yarn.lock`, `pnpm-lock.yaml`, `package.json` | npm (Node.js) |
-| `requirements.txt`, `poetry.lock`, `Pipfile.lock`, `pyproject.toml`, `setup.py` | pypi (Python) |
-| `pom.xml` | maven (Java) |
-| `go.mod` (+ `go.sum`) | go (Golang) |
-| `Cargo.lock` | cargo (Rust) |
-| `composer.lock` | composer (PHP) |
-| `Gemfile.lock` | bundler (Ruby) |
-| `packages.lock.json`, `project.assets.json` | nuget (.NET) |
-| `build.gradle`, `build.gradle.kts` | gradle |
-| `Podfile.lock` | cocoapods (iOS) |
-| `conan.lock`, `conanfile.txt` | conan (C++) |
-| `conda-lock.yml`, `environment.yml` | conda |
-| `vcpkg.json`, `vcpkg-lock.json` | vcpkg (C++) |
-| `packages.list`, `installed`, `status` (dpkg) | linux (OS packages) |
-
-**Technical details — what each parser captures:**
-
-- **npm** (`node.py`): handles `package-lock.json` **v1, v2 and v3** (v1 uses a nested
-  `node_modules` tree, v2/v3 use a flat `packages` map); `yarn.lock` **v1 and v2/berry**;
-  `pnpm-lock.yaml` v5/v6/v9. Captures SRI `integrity` hashes (e.g. `sha512-...`), direct/dev
-  flags from the root package's `dependencies`/`devDependencies`, and dependency edges by
-  resolving the nearest `node_modules` install.
-- **Python** (`python_parser.py`): `requirements.txt` (recursively follows `-r` includes,
-  resolves ranges against the PyPI JSON API), `poetry.lock` (hashes from `files[]`, edges from
-  `dependencies`), `Pipfile.lock` (default vs develop groups), `pyproject.toml` (PEP 621 + legacy
-  poetry style), and `setup.py` (parsed with Python's AST — **never executes** your setup script).
-- **Maven** (`maven_resolver.py` — the most powerful parser): assembles the *effective POM*
-  (inheritance, property `${}` resolution, `dependencyManagement`, imported BOMs), resolves the
-  **full transitive tree** with conflict resolution (nearest-wins), prunes `test/provided`
-  scopes, and even fetches POMs from Maven Central online (SQLite-cached) or from a bundled
-  offline tree dataset. Attaches licenses, homepage, and SHA-1 hashes. Falls back to a simple
-  `java_parser.py` if needed.
-- **Go** (`go_parser.py`): parses `require` blocks, marks `// indirect` lines as transitive, and
-  attaches **go.sum `h1:` SHA-256 integrity hashes**.
-- **Cargo (Rust)**: parses `Cargo.lock`, attaches the crate `checksum` (SHA-256), builds edges
-  by crate name.
-- **Composer (PHP)**: direct/dev flags from `composer.json`, hashes from `dist.sha256`/`shasum`,
-  edges from `require`/`require-dev`.
-- **Bundler (Ruby)**: reads the `GEM`/`GIT`/`DEPENDENCIES` sections of `Gemfile.lock`; nested
-  indentation defines dependency edges.
-- **NuGet (.NET)**: `packages.lock.json` (direct/transitive via `type` field, `contentHash`
-  SHA-512) and `project.assets.json` (edges from `dependencies`, `sha512` hashes); directness
-  cross-checked against `<PackageReference>` in `.csproj` files.
-- **Gradle**: manifest-only parsing of `implementation/api/...` configurations plus **version
-  catalogs** (`libs.versions.toml`) with `version.ref` resolution. (No transitive resolution —
-  listed as a known limitation.)
-- **Cocoapods / Conan / Conda / vcpkg / Linux**: parse their lock files or package stores; e.g.
-  dpkg `status` stanzas → `pkg:deb` components.
-
----
-
-### 6.3 Binary artifact analysis
-
-**Files:** `scanner/binary_parser.py`
-
-#### Plain English
-
-Some projects ship **already-built binaries** without full source. This tool can read those
-binaries directly and pull out their "ingredients":
-
-- **Python wheel** (`.whl`) — reads the embedded `.dist-info/METADATA` for name/version and its
-  required dependencies.
-- **Java JAR** (`.jar/.war/.ear`) — reads `META-INF/maven/*/pom.properties` and the embedded
-  `pom.xml` for coordinates and dependencies.
-- **Windows PE** (`.exe/.dll`) — reads the **import table** to list the Windows DLLs the binary
-  links against (filtering out OS noise like `kernel32.dll`).
-- **Linux ELF** (`.so/.elf`) — reads the `DT_NEEDED` entries to list linked shared libraries.
-
-#### Technical details
-
-- Identification is by file extension first, then **magic bytes** (`MZ` → PE; `\x7fELF` → ELF;
-  `PK` zip sniffed for `.dist-info` vs `META-INF` → wheel vs jar).
-- PE import parsing uses the `pefile` library, with a raw byte-scan regex fallback.
-- ELF parsing is **hand-implemented** (parses the ELF header, locates `.dynamic`/`.dynstr`
-  sections, reads `DT_NEEDED`), supporting 32/64-bit and endianness, with a regex fallback.
-- Each binary gets a **SHA-256 file hash**; every extracted dependency is linked back as a child
-  (`parents=[binary]`).
-- In the dashboard these appear under a dedicated **Binaries** tab with the components extracted
-  from them.
-
----
-
-### 6.4 Source / import analysis (reachability, shadow & unused deps)
-
-**Files:** `scanner/ast_scanner.py`, `scanner/runner.py`
-
-#### Plain English
-
-The tool **reads your actual code** to find what's really being used. It scans import statements
-across 10+ languages. Three powerful outputs come from this:
-
-1. **Reachability** — if a vulnerable library is in your dependency tree but your code never
-   imports it, the risk is lower. The tool marks each vulnerability as **reachable from code** or
-   not, and shows exactly which `file:line` uses it.
-2. **Shadow dependencies** — code imports a package that is **not declared in any manifest**.
-   This is a red flag (it could be a malicious/hijacked package) — flagged as a `shadow_dependency`
-   and still CVE-scanned.
-3. **Unused dependencies** — a package is declared in the manifest but **never imported**.
-   Flagged as `unused_dependency` (dead weight / supply-chain bloat).
-
-#### Technical details
-
-- Per-language static analysis: Python uses real `ast.parse` (never executes code); JS uses
-  regex for `require`/`import`/dynamic `import()`; Go, Java, C#, Ruby, Rust, PHP use regex; and
-  C/C++ maps `#include <header>` → library name (`zlib.h`→zlib, `openssl/ssl.h`→openssl,
-  `curl/curl.h`→curl, `sqlite3.h`→sqlite3, `boost/...`→boost, etc.).
-- Stdlib / built-in / system-header lists keep false positives low (Python stdlib, Node core
-  modules, JDK prefixes, .NET BCL prefixes, C system headers).
-- Import names are mapped to real package names (`cv2`→`opencv-python`, `PIL`→`Pillow`,
-  `sklearn`→`scikit-learn`, `bs4`→`beautifulsoup4`).
-- Import locations are attached to components and shown in the **code browser** with per-line
-  vulnerability markers.
-
----
-
-### 6.5 Vulnerability engine
-
-**Files:** `vuln/osv.py`, `vuln/cache.py`, `vuln/seed_data.json`
-
-#### Plain English
-
-This is the "expiry checker". Every component `name@version` is checked against:
-
-1. **Bundled offline dataset** — 836 curated security advisories across 8 ecosystems
-   (npm, PyPI, Maven, RubyGems, Go, Packagist, crates.io, NuGet), so the whole tool works
-   **completely offline** — a hard requirement for NTRO.
-2. **Live OSV API** — Google's public vulnerability database, queried at scan time, with
-   **everything cached in local SQLite**, so repeat scans are instant and don't hammer the
-   network.
-
-Version matching is precise: advisories specify an *introduced* version (first affected,
-inclusive) and a *fixed* version (safe, exclusive). If your version falls in that window, you're
-vulnerable.
-
-#### Technical details
-
-- OSV ecosystem mapping: npm→npm, pypi→PyPI, maven→Maven, go→Go, cargo→crates.io,
-  composer→Packagist, bundler→RubyGems, nuget→NuGet, gradle→Maven.
-- Live lookups run through `query_osv_batch` with an 8-thread pool; cached entries short-circuit
-  with zero network. The single-package `OSV_API` endpoint is used (the `/v1/querybatch` constant
-  exists but is currently unused).
-- CVSS parsing handles both legacy (vector string ending in `:9.8`) and modern (numeric score +
-  vector) OSV shapes; the **highest** score wins when multiple severities exist.
-- Severity labels: CRITICAL ≥ 9.0, HIGH ≥ 7.0, MEDIUM ≥ 4.0, LOW > 0, else UNKNOWN. Falls back
-  to `database_specific.severity` (GitHub/npm style labels) when no CVSS is present.
-- **KEV flag** (CISA Known-Exploited) is detected heuristically from advisory metadata
-  (searches for CISA+KEV / "exploited" markers) — best-effort, not a live CISA feed.
-- **Malicious packages** are flagged when the advisory ID starts with `MAL-` (OSV's malware
-  prefix).
-- The bundled `seed_data.json`: 836 records, 819 unique IDs, 153 distinct packages; 228 PyPI,
-  201 npm, 120 Maven, 91 RubyGems, 69 Go, 55 Packagist, 47 crates.io, 25 NuGet. Real CVE numbers
-  live in the `aliases` field (e.g. `GHSA-29mw-wpgm-hmr9` aliases `CVE-2020-28500` for lodash).
-- Semver comparison ignores pre-release/build suffixes for range matching
-  (`4.17.21-rc.1` compares equal to `4.17.21`).
-
----
-
-### 6.6 Context analyzer — red flags, remediation & stats
-
-**Files:** `context/analyzer.py`
-
-#### Plain English
-
-Knowing "you have a vulnerability" is only half the story. This module adds the **context** that
-makes the report actionable:
-
-- **Severity + CVSS**: a score from 0–10 and a vector string, so you know *how* dangerous.
-- **Fix command**: the exact, copy-pasteable command to upgrade, in the right package manager:
-  - Python → `pip install --upgrade requests>=2.32.0`
-  - Node → `npm install lodash@4.17.21`
-  - Go → `go get github.com/foo/bar@v1.2.3`
-  - Rust → `cargo update -p serde --precise 1.0.200`
-  - PHP → `composer require vendor/pkg:1.2.3`
-  - Ruby → `bundle update pkg -v 1.2.3`
-  - .NET → `dotnet add package Foo --version 1.2.3`
-  - Java/Gradle → "bump ... to ... in your build file".
-- **Red-flag anomalies** — the tool actively hunts for suspicious patterns:
-  - **Typosquatting** — a package name almost identical to a popular one (e.g. `requests` vs
-    `reqests`).
-  - **Unpinned version** — versions like `*`, `^1.0`, `>=2.0` (you don't know what you'll get).
-  - **Dependency confusion** — packages from `file:`, `workspace:`, `git+` or private registry
-    prefixes, or package names that don't exist in the public registry (hijack risk).
-  - **Unmaintained** — no release in 2+ years (HIGH if 5+ years).
-  - **Suspicious provenance** — a package published very recently (≤90 days) that isn't popular.
-  - **Deprecated / yanked** — the version is marked yanked (PyPI) or deprecated (npm).
-  - **Version drift** — the same direct package present at multiple versions.
-  - **Copyleft license conflicts** — e.g. GPL/AGPL/SSPL inside a permissive/commercial project.
-  - **Shadow / unused dependencies** — from the AST analysis (see 6.4).
-
-#### Technical details
-
-- Direct-dependency checks gate most anomaly checks to keep false positives low.
-- License/supplier metadata is enriched from bundled `seed_licenses.json` (offline-safe), live
-  PyPI/npm registry data, and (optionally) the ClearlyDefined API.
-- Copyleft severity: AGPL/SSPL → HIGH, GPL → MEDIUM, others → LOW. If the *project* license is
-  permissive, a copyleft dependency raises a HIGH "license conflict".
-- Final `stats` dict powers the dashboard cards: total/direct/transitive components, vulnerable
-  components, unique vulnerabilities, per-severity counts, `max_severity`, KEV count, malicious
-  count, reachable-vulnerability count, binary count, lock-file count, import/binary component
-  counts, and anomaly count.
-
----
-
-### 6.7 SBOM generation — CycloneDX & SPDX
-
-**Files:** `sbom/generator.py`, `sbom/spdx30.py`, `sbom/hashing.py`
-
-#### Plain English
-
-The whole point of the tool is to produce the **official machine-readable ingredient list**.
-It emits three industry-standard formats:
-
-- **CycloneDX 1.5** (JSON) — the modern favorite for security tooling.
-- **SPDX 2.3** (JSON) — the other major standard, widely used by legal/licensing teams.
-- **SPDX 3.0** (JSON) — the next-generation format.
-
-Crucially, these aren't just "a list of names" — each SBOM has the **vulnerabilities, integrity
-hashes, and dependency relationships embedded inside**, so whoever receives the file gets the
-full security picture, not just the ingredient names.
-
-#### Technical details
-
-- CycloneDX is built with the official **`cyclonedx-python-lib`** (never a hand-rolled schema):
-  metadata component, `purl` per component, hashes, licenses, scope (OPTIONAL for dev), custom
-  `Property`s for direct/dev/source-file/locations, a root `Dependency` linking every direct
-  component, and **embedded `Vulnerability` objects** (rating with CVSS method chosen from the
-  vector prefix — CVSS:4.0 / 3.1 / 3.0, recommendation "Fixed in X", and `kev`/`malicious`/
-  `reachable` properties). A `files[]` array (SHA-256 content hashes) is post-injected.
-- SPDX 2.3 is hand-built: one `SPDXRef-Package` per component with checksums, `externalRefs`
-  (purl PACKAGE-MANAGER ref + license ref), `DEPENDS_ON` relationships per edge, vulnerabilities
-  encoded as SECURITY/advisory external refs linked by `AFFECTS`, an NTIA-minimum root package
-  (`DESCRIBES`, `DEPENDS_ON`, `CONTAINS` each hashed file), and `externalDocumentRefs` +
-  `PREREQUISITE_FOR` for linked SBOMs. Deterministic `documentNamespace`.
-- SPDX 3.0 (core profile): JSON-LD with `Package`/`Vulnerability`/`Relationship` elements,
-  `usesDependency`, `affects`, `rootElements`, `verifiedUsing` hashes.
-- `hashing.py` computes **SHA-256 + SHA-1** for every project file in one pass (thread-pooled),
-  capped (2 MiB/file, 20,000 files by default) to stay fast.
-- SBOM generation is reproducible: options mirror ms-sbom-tool's `-gt/-nsb/-nsu`
-  (reproducible timestamp, namespace base/unique) and serial numbers become deterministic
-  `uuid5` when a namespace base is set.
-
----
-
-### 6.8 Reports — HTML & PDF
-
-**Files:** `report/generator.py`, `report/pdf.py`
-
-#### Plain English
-
-Not everyone wants raw JSON. The tool produces a **printable HTML report** and a **PDF report**
-that an executive can read: a big **Supply-Chain Health Score** circle, a severity bar, stat
-cards, a vulnerability findings table, an anomaly table, the full component inventory, binary
-artifacts, and a license summary.
-
-#### Technical details
-
-- **Health score formula:** `100 − (CRITICAL × 30) − (HIGH × 12) − (MEDIUM × 5) − (LOW × 2)`,
-  clamped 0–100; labelled (e.g. Excellent / Good / At Risk).
-- HTML report is a single self-contained file (dark themed, `@media print` stylesheet that flips
-  to white/black for printing), with CVE links to NVD, per-finding flag badges
-  (`CISA KNOWN EXPLOITED` / `MALICIOUS` / `REACHABLE`), "Used In file:line" links, "Fixed In"
-  and the remediation command.
-- PDF uses **reportlab**, A4, latin-1-safe text cleaning, per-row severity coloring, and page
-  numbers. Served at `GET /api/scan/{id}/report.pdf` with filename `sbom-report-{id}.pdf`.
-
----
-
-### 6.9 Policy engine — gate your CI/CD
-
-**Files:** `policy/engine.py`, `policy/store.py`
-
-#### Plain English
-
-Organizations want to **enforce rules**, not just view reports. The policy engine lets an admin
-define rules, and the scan result gets a `passed` / `failed` verdict with a list of violations.
-Examples: "fail if any CRITICAL vulnerability", "fail if any CISA Known-Exploited issue", "fail
-if a malicious package is present", "block this specific package/version", "block copyleft
-licenses".
-
-#### Technical details
-
-- Rules: `max_severity`, `max_vulnerabilities`, `fail_on_kev`, `fail_on_malicious`,
-  `blocked_package` (name/version aware, with allowlist), `blocked_license` /
-  `allowed_license`.
-- Default policy ships with the tool: max severity `critical`, max vulnerabilities `0`,
-  `fail_on_kev: true`, `fail_on_malicious: true`, blocked licenses `AGPL-3.0`, `AGPL-3.0-only`,
-  `AGPL-3.0-or-later`, `SSPL-1.0`.
-- Policies are stored per-organisation in SQLite; the web layer evaluates the org's effective
-  policy, the CLI uses the default.
-
----
-
-### 6.10 The `sbomgen` CLI
-
-**Files:** `backend/sbomgen.py`
-
-#### Plain English
-
-The whole engine is available from the command line, which is how it plugs into **CI/CD
-pipelines** (GitHub Actions, GitLab CI, Jenkins...). Run it on every commit; if a critical
-vulnerability appears, the build **fails** with exit code 2.
-
-```powershell
-# Scan a folder, offline, emit CycloneDX
-python -m sbomgen scan D:\repos\my-app --offline --format cyclonedx -o sbom.json
-
-# Scan a zip, full JSON result
-python -m sbomgen scan app.zip --format json
-
-# Scan a GitHub repo and produce a PDF
-python -m sbomgen scan https://github.com/owner/repo --format pdf -o report.pdf
-
-# Gate your pipeline
-python -m sbomgen scan D:\repos\my-app --fail-on high    # exits 2 if anything >= HIGH
+```
+PAGING: Bootloader kernel phys base = 0x1800000
 ```
 
-#### Technical details
+The heap starts at virtual `0xC0000000 + 0x4000000 = 0xC4000000`. Under the bootloader's mapping, this virtual address maps to physical `0x1800000 + 0x4000000 = 0x5800000`. But `kmalloc_ap` calculates:
 
-- Subcommands: `scan`, `validate` (verify files against manifest), `format` (structural
-  validation), `conformance` (NTIA minimum), `aggregate` (merge 2+ SBOMs), `redact` (strip file
-  detail), `sign` (Ed25519), `verify`, `verify-catalog`.
-- Formats: `json` (full ScanResult), `cyclonedx`, `spdx`, `spdx30`, `html`, `pdf`.
-- Exit codes: `0` success, `1` scan/IO error, `2` `--fail-on` gate tripped or validation failed.
-- A Python library API is also exported (`scan()`, `validate()`, `aggregate()`, `redact()`,
-  `sign()`, `verify_signature()`) for embedding.
-- `--config` supports JSON config files with `$(ENV_VAR)` expansion; `--telemetry-file` writes
-  structured scan telemetry.
-
----
-
-### 6.11 Auth & multi-tenancy
-
-**Files:** `auth/security.py`, `auth/store.py`, `auth/deps.py`, `api/auth_routes.py`
-
-#### Plain English
-
-The web app supports **multiple organisations** with real accounts, so each team only sees its
-own scans. Users have roles (admin / analyst / viewer), admins can manage users and generate
-API tokens for automation, and every important action is written to an **audit log**.
-
-#### Technical details
-
-- bcrypt (10 rounds) password hashing; HS256 JWTs with 12-hour expiry; signing key from
-  `SBOM_SECRET_KEY` env or a persisted secret file.
-- Service-account API tokens (`sbom_<48 hex>`) are stored as SHA-256 hashes and accepted in
-  `Authorization: Bearer` alongside JWTs.
-- SQLite tables: `organizations`, `users`, `audit_log`. Org-scoped scan visibility is enforced
-  on every scan endpoint.
-
----
-
-### 6.12 Frontend dashboard
-
-**Files:** `frontend/src/App.jsx`, `api.js`, `graph.js`, `components/*`
-
-#### Plain English
-
-The dashboard is where everything comes together visually. After a scan completes you get:
-
-- **Summary cards** — total/direct/transitive components, lock files, binaries, import-detected
-  deps, vulnerable components, unique vulnerabilities, reachable vulns, KEV count, anomalies —
-  plus an animated health-score ring and severity distribution bar.
-- **Dependency graph** — an interactive tree. Red nodes = vulnerable, attack paths from the root
-  to a vulnerable node are highlighted in red, import-detected and binary nodes get dashed
-  rings. You can zoom, pan, expand/collapse, and control depth.
-- **Components table** — searchable + filterable by severity, ecosystem, dependency type
-  (direct/transitive/dev), vulnerable-only, and origin (lockfile/manifest/import/binary).
-- **Context panel** — click any component: where it's used in code, who depends on it and what it
-  depends on, integrity hashes, and each vulnerability with CVSS, flags, and the **copy-paste
-  fix command**.
-- **Code browser** — browse the uploaded source; vulnerable lines are marked with severity
-  colors.
-- **Anomalies / Licenses / Binaries tabs** — red flags feed, license compliance view with
-  copyleft warnings, and extracted binary artifacts.
-- **Scan history** — all previous scans, with **compare (diff)** between two scans
-  (added/removed components, new/resolved vulnerabilities, before/after score) and **merge**
-  into a combined SBOM.
-
-#### Technical details
-
-- Polling: `pollScan` checks `GET /api/scan/{id}` every **1.5 s** until terminal state; a 900 ms
-  step-timer drives the 4-step progress animation.
-- The graph is **d3-hierarchy** (not a force-directed library): a synthetic root node, children
-  edges from each component's `children`, cycle protection via ancestor checks, and **attack
-  paths** computed by BFS from root + backtracking from every vulnerable node.
-- Severity colors: CRITICAL/HIGH/MEDIUM/LOW mapped to a fixed palette; vulnerable nodes pulse.
-- The frontend build (`frontend/dist`) is served directly by FastAPI (SPA catch-all with
-  `html=True`), and `vite.config.js` proxies `/api` → `:8000` in dev.
-- A PyInstaller windowed build launches a **pywebview (EdgeChromium)** window with a JS bridge
-  that saves exports straight to `~/Downloads`, falling back to the default browser.
-
----
-
-## 7. Key design decisions
-
-| Decision | Why it makes the submission strong |
-|---|---|
-| **Lock files over source scanning** | Lock files record *exact resolved versions* — the ground truth. No guessing. |
-| **Polyglot detection in one pass** | One scan covers mixed projects (Python + JS + Java...) automatically. |
-| **Binary artifacts counted too** | Wheels/JARs/PE/ELF are parsed directly — shipped binaries land in the SBOM even without source. |
-| **Lock-file-less fallback** | AST/import analysis still surfaces the third-party packages *actually used*. |
-| **Bundled offline dataset + live OSV + SQLite cache** | Offline-safe for NTRO, fresh when online, fast on repeat scans. |
-| **Official CycloneDX library** | Standards compliance without hand-rolled schema errors. |
-| **Vulnerabilities embedded in the SBOM** | The SBOM is consumable end-to-end — one file carries the whole picture. |
-| **Source-aware analysis** | Reachability, shadow deps and unused deps turn a list into *actionable risk*. |
-| **Background jobs + polling** | 2,000+ dependency repos don't block the API. |
-| **Policy engine + CLI** | CI/CD gating — the tool isn't just a UI, it's a pipeline guard. |
-| **Everything in SQLite** | No database server to install; portable, restart-safe. |
-
-### Known limitations (be honest if asked)
-
-- Gradle is manifest-only (no transitive resolution).
-- Yarn lock parsing produces a flat list (no dependency edges) — directness comes from
-  `package.json`.
-- KEV detection is a heuristic from advisory metadata, not a live CISA feed.
-- The OSV "batch" lookup currently performs one request per component (8 concurrent threads)
-  rather than a single `/querybatch` call — cached entries avoid re-querying.
-- Semver range matching ignores pre-release/build suffixes.
-
----
-
-## 8. How to run it
-
-### 1. Backend
-
-```powershell
-cd backend
-pip install -r requirements.txt
-python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
+```
+phys = 0xC4001000 - 0xC0000000 = 0x4001000  ← WRONG (should be 0x5801000)
 ```
 
-### 2. Frontend (development, hot reload)
+**Every page table structure allocated by `kmalloc_ap` gets the wrong physical address written into its parent's entry.** On QEMU with small RAM, the kernel often lands at `0x100000` so `kernel_phys_base = 0` and the bug is hidden. On real hardware with 8+ GB RAM, the kernel lands elsewhere and every `CR3`, `PDE`, `PDPTE`, and `PTE` points at the wrong physical frame.
 
-```powershell
-cd frontend
-npm install
-npm run dev          # http://localhost:5173 (proxies /api → :8000)
+**What Linux does**: Linux's `__pa()` / `__va()` macros use a compile-time or boot-time offset (`phys_base`) that is set correctly by `startup_64`. The offset is never hardcoded.
+
+### 2B. The "Blind 1GB Identity Map" Problem
+
+[paging.c:87–98](file:///d:/1os-copy/backup/1os/src/kernel/hal/paging.c#L87-L98):
+
+```c
+for (uint64_t i = 0; i < 0x40000000; i += 0x1000) {
+    page_t *page = get_page(i, 1, kernel_pml4);
+    page->present = 1;
+    page->rw = 1;
+    page->frame = i >> 12;
+}
 ```
 
-For a single-binary deployment, build once and FastAPI serves it:
+This maps **all** of 0–1GB as present+writable, regardless of what the UEFI memory map says. On the Lenovo LOQ, the first 1GB contains:
 
-```powershell
-cd frontend && npm run build
-# then open http://127.0.0.1:8000/
-```
+- **MMIO holes** (e.g., PCIe config space, HPET, TPM MMIO)
+- **ACPI NVS** (firmware-owned, must not be overwritten)
+- **ACPI Reclaim** (tables the kernel reads)
+- **Reserved** regions (SMM, firmware runtime)
+- **EfiRuntimeServicesCode/Data** (used by UEFI runtime)
 
-### 3. Tests
+Mapping all of these as normal writable RAM means:
+1. **The CPU may cache MMIO reads** (PCD/PWT bits are 0 = Write-Back caching)
+2. **Speculative writes to reserved regions** corrupt firmware state
+3. **ACPI NVS corruption** can cause SMM handlers to crash
 
-```powershell
-cd backend
-python tests\test_e2e.py          # end-to-end API tests (npm + PyPI + multi-app)
-python tests\test_regression.py   # severity/robustness regressions
-python tests\test_binary.py       # wheel/JAR/PE/ELF + lock-file-less detection
-python tests\test_cli.py          # sbomgen CLI (formats, exit codes, --fail-on)
-cd .. && cd frontend && npm run build
-```
+**What Linux does**: Linux's `init_mem_mapping()` consults the E820/UEFI memory map and only maps `EfiConventionalMemory` regions as WB-cacheable. MMIO regions get mapped with `PAGE_KERNEL_IO` (PCD=1, PWT=1). Reserved/NVS/RuntimeServices regions are mapped with appropriate attributes or not mapped at all until needed.
 
-### 4. CLI
+### 2C. No PAT (Page Attribute Table) Configuration
 
-```powershell
-cd backend
-python -m sbomgen scan D:\repos\my-app --offline --format cyclonedx -o sbom.json
-python -m sbomgen scan app.zip --format json
-python -m sbomgen scan https://github.com/owner/repo --format pdf -o report.pdf
-```
+PureOS never programs the PAT MSR and never sets PCD/PWT/PAT bits on MMIO mappings (except the xHCI mapping which sets `pcd = 1`). This means:
 
-### 5. Standalone `.exe` (no installs needed)
+- **Framebuffer** at 0xE0000000: mapped as Write-Back (should be Write-Combining for performance)
+- **LAPIC** at 0xFEE00000: mapped as Write-Back (must be Uncacheable — Intel SDM Vol 3A §11.4.1)
+- **IOAPIC** at 0xFEC00000: same problem
 
-```powershell
-cd frontend && npm run build
-cd ..
-pip install pyinstaller
-python -m PyInstaller SBOM-Gen.spec --noconfirm   # -> dist\SBOM-Gen.exe
-```
+**What Linux does**: Linux initializes PAT early in `pat_init()` and uses `ioremap_nocache()` / `ioremap_wc()` to set correct cache attributes per MMIO region.
 
-> The vuln cache DB defaults to `%LOCALAPPDATA%\sih1449\vulns.db` (set `SBOM_DB_PATH` to
-> override). Some drives/antivirus setups break SQLite locking, hence C: by default.
+### 2D. 4KB Page Walk vs 2MB Huge Pages
+
+The bootloader uses **2MB huge pages** for the initial mapping, but `paging_init()` rebuilds everything with **4KB pages**. This is functionally correct but creates a brief window during the CR3 switch where TLB entries for 2MB pages coexist with 4KB page table structures. On Intel CPUs with PCID disabled, this can cause TLB inconsistencies if an interrupt fires during the transition.
 
 ---
 
-## 9. Demo script for judges
+## 3. PCI Enumeration
 
-> Goal: ~7 minutes. Setup beforehand: backend running at `http://127.0.0.1:8000`, frontend
-> built. The demo uses `D:\1SIH_Hackthon\samples\multi-app` (a polyglot demo containing both
-> `package-lock.json` and `requirements.txt`).
+### What PureOS Does
 
-### 0:00 — The pitch (30 s)
-> "Software today is 80–90% third-party libraries. Nobody can manually track thousands of
-> versions. Our tool, SBOM-Gen, automatically generates the complete ingredient list — a
-> Software Bill of Materials — checks every ingredient against known vulnerabilities, tells you
-> exactly how to fix them, and works fully offline. NTRO's exact requirement."
+[pci.c:424–454](file:///d:/1os-copy/backup/1os/src/drivers/pci.c#L424-L454):
 
-### 0:30 — Launch a scan (30 s)
-1. Open `http://127.0.0.1:8000`.
-2. In the uploader, choose the **folder path** input.
-3. Paste `D:\1SIH_Hackthon\samples\multi-app`.
-4. Click **Scan**. Point out the progress steps.
-> "Notice it detected two ecosystems at once — Node and Python. Watch the 4-step pipeline:
-> detect → parse → analyze → report."
+```c
+void pci_init() {
+    for (uint16_t bus = 0; bus < 1; bus++) {      // ⚠️ BUS 0 ONLY
+        for (uint8_t device = 0; device < 32; device++) {
+```
 
-### 1:30 — Summary cards + graph (90 s)
-1. When complete, gesture at the **summary cards**.
-> "Here's the headline: X components across two ecosystems, Y vulnerable, Z reachable from
-> code, and an overall health score."
-2. Switch to the **graph** tab. Hover/pan/zoom.
-> "Each node is a library. Red nodes are vulnerable. Notice how the vulnerable node sits deep in
-> the dependency tree — it came in as a transitive dependency. We traced the attack path from
-> the root to it."
+- Uses **legacy I/O port 0xCF8/0xCFC** (Configuration Mechanism 1) — fine for Bus 0 devices
+- **Scans only Bus 0** — misses devices behind PCI-to-PCI bridges
+- Does not parse the MCFG table for PCIe Enhanced Configuration Access Mechanism (ECAM)
+- No BAR size detection (no write-all-1s + readback)
 
-### 3:00 — Click a vulnerable package (90 s)
-1. Click `lodash@4.17.12` (or whichever vulnerable node shows).
-2. Point to the **context panel**:
-   - CVSS 9.8, CRITICAL, CVE ID (CVE-2019-10744).
-   - **"Reachable in code"** badge → "we proved it's actually imported in `src/index.js`".
-   - The **fix command** → copy it.
-> "Vulnerabilities alone are noise. We tell you *where it is*, *whether you're actually using
-> it*, and the *exact one-line fix*. This is what 'contextual guidance' in the problem statement
-> means."
+### What Linux Does
 
-### 4:30 — Export SBOMs (60 s)
-1. Click **CycloneDX** and **SPDX**.
-> "These are the government-standard formats. Open the file and show the embedded
-> vulnerabilities, integrity hashes, and dependency relationships — a single consumable file,
-> not just a name list."
-2. Click **Report (PDF)** and open the PDF.
-> "And here's the executive view — a health score and a findings table that a non-technical
-> stakeholder can read."
+1. Parses **MCFG** ACPI table to find ECAM base address for PCIe MMIO config
+2. Enumerates all 256 buses recursively, following PCI-to-PCI bridges
+3. Performs BAR sizing (write 0xFFFFFFFF, read back, restore original) to determine BAR size
+4. Assigns resources from firmware-provided _CRS ranges
 
-### 5:30 — Prove offline mode (60 s)
-1. Toggle **offline mode** on and re-scan.
-> "This is the NTRO differentiator — no internet. All vulnerability data is bundled inside the
-> tool (836 advisories across 8 ecosystems). Flip the switch and it still finds the same
-> critical issue."
+### Impact on Real Hardware
 
-### 6:30 — CI/CD (30 s, optional if time permits)
-> "The same engine runs headless. `python -m sbomgen scan ... --fail-on high` — exit code 2
-> fails the pipeline. One click in the UI, one command in the pipeline — same result."
+The Lenovo LOQ has xHCI on Bus 0 (confirmed by serial log: `B0 D4 F0`), so the Bus-0-only scan **does find it**. However:
 
-### Closing line
-> "To summarize: automatic, polyglot, offline-capable, standards-compliant SBOM generation with
-> actionable, reachability-aware vulnerability context — built for exactly NTRO's problem."
+- The NVMe controller is likely behind a PCIe bridge on a higher bus → not found → no storage
+- Missing bridge enumeration means MMIO windows for downstream devices are unknown
+- The AHCI and NVMe drivers show `[SKIPPED]` in the PCI scan, which is correct for safe mode
+
+> [!IMPORTANT]
+> Bus-0-only scan is **not the crash cause** (xHCI is found), but it prevents NVMe/AHCI storage from ever working on real hardware.
 
 ---
 
-## 10. Likely judge questions & suggested answers
+## 4. xHCI Ownership — The Most Visible Crash Point
 
-**Q1. What is an SBOM and why does it matter?**
-An SBOM (Software Bill of Materials) is a machine-readable list of every component in a piece of
-software, with versions, hashes and relationships. It matters because ~90% of modern software is
-third-party code — if you don't know what's in your software, you can't know if you're
-vulnerable. NTRO and similar agencies need SBOMs for software they procure, to audit supply
-chains and respond to incidents quickly.
+### The Full Linux xHCI Takeover Sequence
 
-**Q2. Why lock files instead of scanning the source?**
-A lock file records the *exact resolved* versions that were actually installed, including every
-transitive dependency. Source scanning only tells you what the code *asks* for — the range
-`^4.0.0` could resolve to many versions. Accuracy of versions and the complete transitive tree
-is only possible from lock files.
+Linux's `xhci_pci_probe()` → `usb_hcd_pci_probe()` → `xhci_pci_setup()`:
 
-**Q3. What if a project has no lock file?**
-We fall back, in order: (1) parse the manifest (`package.json`, `requirements.txt`,
-`pyproject.toml`...) and resolve version ranges via the registry API; (2) analyse the actual
-imports in the code with our AST scanner. Accuracy drops slightly, but we still surface the
-third-party packages actually used. We also flag unpinned versions as an anomaly.
+1. **`quirk_usb_handoff_xhci()`** (in `drivers/usb/host/pci-quirks.c`):
+   - Read HCCPARAMS1 → find Extended Capabilities pointer
+   - Walk ext cap list looking for USBLEGSUP (Cap ID = 1)
+   - Set HC OS Owned Semaphore (bit 24)
+   - Wait up to 1 second for BIOS to clear bit 16
+   - **Clear USBLEGCTLSTS** (SMI sources) — disable all SMI generation
+   - If BIOS doesn't release → force clear bit 16, set bit 24
 
-**Q4. How does offline mode work?**
-All vulnerability data ships inside the tool — a bundled dataset of 836 curated advisories
-across 8 ecosystems (npm, PyPI, Maven, RubyGems, Go, Packagist, crates.io, NuGet), plus an
-offline license metadata set. Version-range matching, severity, CVSS and fix commands all work
-from this local data. Online mode layers the live OSV API on top, cached in SQLite.
+2. **Enable Bus Mastering** — set PCI Command register bits 1+2
 
-**Q5. How accurate is the version matching?**
-Advisories declare an introduced (inclusive) and fixed (exclusive) version. We compare your
-version against that window numerically. We parsed real lock-file formats (npm v1–v3, yarn v1/v2,
-poetry, go.sum hashes...) and verified against real npm projects, so the versions themselves are
-exact.
+3. **`xhci_reset()`**:
+   - Write USBCMD.HCRST = 1
+   - Wait for CNR (Controller Not Ready) to clear
+   - Wait for USBCMD.HCRST to self-clear
 
-**Q6. What makes this different from free tools like `npm audit` / `pip-audit` / Dependabot?**
-Those are single-ecosystem. Ours is a *unified, polyglot* tool covering 18+ formats across 8+
-ecosystems plus binary artifacts, producing *standard* SBOMs (CycloneDX/SPDX) that regulators
-require — not just a vulnerability list. We add reachability, shadow/unused dependency
-detection, typosquatting, license conflicts, an offline mode for air-gapped environments, an
-executive health-score report, and a policy gate for CI/CD.
+4. **Set USBCMD.RS = 0** (stop), wait for HCHalted
+5. **Program DCBAA, Command Ring, Event Ring**
+6. **Configure MSI/MSI-X** (NOT pin interrupts)
+7. **Set USBCMD.RS = 1** (run)
 
-**Q7. How do you determine "reachable"?**
-Our AST scanner parses the actual import statements in your source (Python, JS, Go, Java, C#,
-Ruby, PHP, Rust, C/C++). If a vulnerable package's name matches an import, we mark every
-vulnerability for that package as reachable and record the exact file:line. Otherwise we still
-report it, but flag it as not reachable from code — lower priority.
+### What PureOS Does
 
-**Q8. How is this handled in CI/CD?**
-Two ways: the `sbomgen` CLI with `--fail-on <level>` (exits 2 when the worst vulnerability
-crosses the threshold), and a policy engine (`max_severity`, `max_vulnerabilities`,
-`fail_on_kev`, `fail_on_malicious`, blocked packages/licenses) evaluated on every scan. Your
-pipeline can block the merge, not just warn.
+[pci.c:318–401](file:///d:/1os-copy/backup/1os/src/drivers/pci.c#L318-L401) + [xhci.rs:118–](file:///d:/1os-copy/backup/1os/rust/src/xhci.rs#L118):
 
-**Q9. What about licenses?**
-Every component gets a declared license where available (from lock file, bundled dataset, live
-registry, or ClearlyDefined). We classify permissive vs copyleft, flag copyleft (AGPL/SSPL/GPL)
-as anomalies, raise a HIGH "license conflict" when a permissive project pulls in copyleft code,
-and render a license compliance dashboard with counts.
+```
+Flow: BAR read → dynamic MMIO mapping → _OSC eval → Bus Master enable →
+      USBLEGSUP handoff → rust_xhci_init() → halt → reset → start → enumerate
+```
 
-**Q10. Can it handle compiled/binary-only software?**
-Yes. We parse Python wheels (embedded dist-info), Java JARs (META-INF/pom.properties), Windows
-PE files (import table) and Linux ELF files (DT_NEEDED) — extracting the components and linked
-libraries with file SHA-256 hashes, so a shipped binary still produces an SBOM without source.
+### Gaps
 
-**Q11. How does the health score work?**
-`100 − 30×(critical count) − 12×(high) − 5×(medium) − 2×(low)`, clamped to 0–100. It's a
-single glanceable number an executive can grasp immediately, backed by the detailed findings
-table.
+| Step | Linux | PureOS | Risk |
+|------|-------|--------|------|
+| **BAR reading** | Reads BAR0+BAR1 for 64-bit, masks type bits | ✅ Same — correctly handles 64-bit BAR | 🟢 OK |
+| **MMIO mapping** | `ioremap_nocache()` with proper PTE attributes | Maps to 0x200000000 using `get_page()` + `pcd=1` — but `get_page` calls `kmalloc_ap` which has **broken phys addr calc** (see §2A) | 🔴 CRITICAL |
+| **_OSC evaluation** | Full `acpi_pci_osc_control_set()` with query phase first | Single call, fails with `AE_NOT_FOUND` (no `\_SB.PCI0` on QEMU; real LOQ does have it) | 🟡 Medium |
+| **Bus Mastering** | Standard PCI command register update | ✅ Correct — sets bits 1+2, disables INTx (bit 10) | 🟢 OK |
+| **USBLEGSUP handoff** | Full handoff with SMI disable | ✅ Correct implementation with timeout and force | 🟢 OK |
+| **Interrupt mode** | MSI-X (never uses legacy pin interrupts) | Uses **timer-tick polling at 250 Hz** with INTx disabled | 🟡 Works but misses events between ticks |
+| **HCCPARAMS1 read** | From properly mapped MMIO | From `cap_base[0x10 / 4]` — this reads **offset 0x10 from MMIO base**, which is HCCPARAMS1 ✅ | 🟢 OK |
 
-**Q12. What are "shadow dependencies" and why do they matter?**
-A shadow dependency is a package your code imports but that isn't declared in any manifest. It's
-a red flag because it bypasses your normal dependency management — it could be a
-typosquat/malicious/hijacked package, and no standard tool will update or audit it. We flag it
-as a MEDIUM anomaly and CVE-scan it anyway.
+### The Real Crash Scenario
 
-**Q13. Did you build the SPDX/CycloneDX outputs from scratch?**
-CycloneDX uses the official `cyclonedx-python-lib` to guarantee schema compliance. SPDX 2.3/3.0
-are hand-built JSON — SPDX gives us full control to embed vulnerabilities, file hashes and
-`DEPENDS_ON`/`AFFECTS` relationships exactly as required.
+The xHCI MMIO mapping at `0x200000000` uses `get_page(virt, 1, kernel_pml4)` which internally calls `kmalloc_ap` to allocate new page table levels (PML4[4], PDPT, PD, PT entries for the 8GB range). Because of the `kmalloc_ap` bug (§2A), these page table entries contain **wrong physical addresses**. When the CPU walks the page table to translate `0x200000000`, it reads garbage from the wrong physical frame, and:
 
-**Q14. How do you handle multi-module / huge monorepos?**
-Detection walks the whole tree and scans every ecosystem. Maven resolves every `pom.xml`
-(multi-module) and merges/dedupes by purl. Scans run in background daemon threads with bounded
-parallelism (configurable, default 8) and file hashing caps (2 MiB/file, 20k files) — so even
-2,000+ dependency repos don't block the API.
+- If the garbage happens to have Present=0 → **#PF (page fault)**
+- If the garbage points at some random RAM → MMIO reads return **random memory** instead of controller registers
+- If the garbage points at another MMIO region → controller registers are read from the **wrong device**
 
-**Q15. What about false positives / the reliability of the KEV flag?**
-The KEV flag is a best-effort heuristic from advisory metadata (CISA/KEV/exploited markers),
-clearly a limitation. Core vulnerability matching relies on OSV's structured range data rather
-than keywords, which keeps matching precise. Our offline dataset is curated (836 records, real
-GHSA/PYSEC/GO/RUSTSEC IDs with CVE aliases).
+On QEMU, `kernel_phys_base = 0`, so `kmalloc_ap`'s `- 0xC0000000` is accidentally correct, and everything works. On real hardware with `kernel_phys_base = 0x1800000`, every `kmalloc_ap` physical address is off by 0x1800000.
 
 ---
 
-## 11. Glossary
+## 5. ACPI / SMM Interaction
 
-| Term | Easy meaning |
-|---|---|
-| **SBOM** | Software Bill of Materials — a machine-readable list of all components in a piece of software, like an ingredient label. |
-| **Dependency** | A library your project uses. |
-| **Direct dependency** | A library you declared/asked for yourself. |
-| **Transitive dependency** | A library that arrived *inside* another library (a dependency of a dependency). |
-| **Lock file** | A file a package manager writes that records the *exact* versions installed (e.g. `package-lock.json`, `Cargo.lock`). |
-| **Manifest** | The file where you *declare* dependencies, usually with version ranges (e.g. `package.json`, `requirements.txt`). |
-| **Component** | One library/package in the SBOM (name + version + metadata). |
-| **purl** | Package URL — a universal way to name a package, e.g. `pkg:npm/lodash@4.17.12`. |
-| **Integrity hash** | A cryptographic fingerprint (SHA-1/256/512) that lets you verify a file hasn't been tampered with. |
-| **CVE** | Common Vulnerabilities and Exposures — a public ID for a known security flaw (e.g. `CVE-2019-10744`). |
-| **CVSS** | Common Vulnerability Scoring System — a 0–10 score of how dangerous a flaw is, plus a vector explaining why. |
-| **OSV** | Open Source Vulnerabilities — Google's public vulnerability database, queried via an API. |
-| **KEV** | CISA Known Exploited Vulnerabilities — flaws that are *actually being exploited in the wild*. |
-| **Reachability** | Whether a vulnerable package is actually imported/used in your code (vs just present in the tree). |
-| **Shadow dependency** | A package imported in code but not declared in any manifest — a red flag. |
-| **Typosquatting** | Registering a package with a name almost identical to a popular one (e.g. `reqests`) to trick users. |
-| **CycloneDX** | One of the two major SBOM standards (JSON), loved by security tooling. |
-| **SPDX** | The other major SBOM standard, widely used for licensing. |
-| **SBOM conformance / NTIA minimum** | The minimum required fields every SBOM should have (NTIA "Minimum Elements"). |
-| **Attack path** | The chain of dependencies from your root project down to a vulnerable package. |
-| **Supply-chain health score** | A single 0–100 number summarizing how many and how severe the issues are. |
+### What Linux Does
+
+Linux's ACPI initialization is extensive:
+
+1. **`acpi_init()` → `acpi_bus_init()`** → evaluates `_SB._INI`, `_SB.PCI0._INI`, etc.
+2. **`_OSC` evaluation** (Operating System Capabilities):
+   - Queries firmware: "which features does the platform support?"
+   - Then requests control: "OS wants to own Hot Plug, PME, AER, PCIe native control"
+   - The firmware may **change SMM behavior** based on `_OSC` — e.g., stop intercepting config space writes
+3. **`_REG` evaluation** on every operation region — tells firmware "the OS can now handle this address space"
+4. **`acpi_ec_init()`** — initializes the Embedded Controller (critical for laptops — handles battery, thermal, keyboard backlight)
+5. **Evaluates `_PIC(1)`** (or `_PIC(2)` for IOAPIC) — tells firmware which interrupt model the OS uses
+6. **SCI (System Control Interrupt)** — Linux registers a handler for the ACPI SCI, which firmware uses to notify the OS of events
+
+### What PureOS Does
+
+[acpi.c:89–142](file:///d:/1os-copy/backup/1os/src/kernel/acpi.c#L89-L142):
+
+```c
+AcpiInitializeSubsystem();
+AcpiInitializeTables(NULL, 16, FALSE);
+AcpiLoadTables();
+AcpiEnableSubsystem(ACPI_FULL_INITIALIZATION);
+AcpiInitializeObjects(ACPI_FULL_INITIALIZATION);
+// Then only: parse MADT for CPU/APIC info
+```
+
+### Gaps
+
+| Method | Linux | PureOS | Impact |
+|--------|-------|--------|--------|
+| `_OSC` | Full query + control for PCI root | Attempted in PCI scan, fails `AE_NOT_FOUND` on QEMU | On real LOQ, `_OSC` success could change SMM behavior |
+| `_PIC()` | Called with mode=1 (IOAPIC) | **Never called** | Firmware may keep delivering interrupts in PIC mode even though OS switched to IOAPIC |
+| `_INI` | Evaluated on all devices during bus scan | **Never called** | Device-specific initialization skipped |
+| `_REG` | Evaluated for each OpRegion | ACPICA may handle this internally | Should work via ACPICA |
+| EC init | Full EC driver with event handling | **None** | Thermal events, battery, Fn keys all dead |
+| SCI handler | Registered via `acpi_os_install_interrupt_handler` | Returns `AE_OK` without actually registering | ACPI events silently dropped |
+
+> [!WARNING]
+> **The missing `_PIC(1)` call** is particularly dangerous. On the Lenovo LOQ, the ACPI DSDT likely contains a `_PIC` method that switches internal routing tables. Without calling it, the firmware thinks the OS is using PIC mode, but PureOS has disabled the PIC and enabled IOAPIC. This mismatch can cause interrupts to be routed to the wrong vector or lost entirely.
+
+### `AcpiOsInstallInterruptHandler` — The Silent No-Op
+
+[acpi_osl.c:247](file:///d:/1os-copy/backup/1os/src/kernel/hal/acpi_osl.c#L247):
+
+```c
+ACPI_STATUS AcpiOsInstallInterruptHandler(UINT32 InterruptNumber,
+    ACPI_OSD_HANDLER ServiceRoutine, void *Context) {
+    return AE_OK;  // ⚠️ LIES — claims success but installs nothing
+}
+```
+
+ACPICA calls this to register the SCI handler. PureOS says "yes I installed it" but doesn't. Any ACPI event (GPE, thermal, power button) that generates an SCI will fire an interrupt that has no handler → either lost (IOAPIC mode) or causes a spurious IRQ handler to run.
 
 ---
 
-*Documentation generated for SBOM-Gen (SIH1449). For the most up-to-date run instructions and
-repository layout, see `README.md`.*
+## 6. Interrupt Controller Setup
+
+### What Linux Does
+
+1. **Early**: PIC is initialized and masked by `init_IRQ()` → `x86_init.irqs.pre_vector_init()`
+2. **APIC detection**: `detect_init_APIC()` reads CPUID and MSR
+3. **LAPIC init**: `setup_local_APIC()` — enables LAPIC, sets spurious vector, configures LINT0/LINT1
+4. **IOAPIC init**: `setup_IO_APIC()` — parses MADT interrupt source overrides, programs each IOAPIC entry
+5. **PIC disable**: Only after IOAPIC is fully configured and tested
+6. **Timer source**: Calibrates LAPIC timer against PIT/HPET, then switches to LAPIC timer or HPET for scheduling
+7. **Interrupt source overrides**: MADT may say "IRQ 0 = GSI 2" — Linux handles these remappings
+
+### What PureOS Does
+
+[hal.c:33–52](file:///d:/1os-copy/backup/1os/src/kernel/hal/hal.c#L33-L52):
+
+```c
+void hal_init() {
+    paging_init();     // ← Includes CR3 switch
+    acpi_init();       // ← Parses MADT
+    pic_init();        // ← Remaps PIC to vectors 32-47
+    lapic_init();      // ← Enables LAPIC, configures IOAPIC, THEN disables PIC
+    smp_init();
+}
+```
+
+### Gaps
+
+| Area | PureOS | Linux | Risk |
+|------|--------|-------|------|
+| **PIC→IOAPIC transition** | `pic_init()` remaps PIC first (enables PIC interrupts at vectors 32+), then `lapic_init()` sets up IOAPIC and disables PIC | Linux masks PIC first, sets up IOAPIC, then unmasks specific lines | 🟡 Window where PIC IRQs fire into IOAPIC-destined vectors |
+| **MADT ISO overrides** | Only extracts LAPIC/IOAPIC addresses | Linux processes Interrupt Source Override entries (e.g., "ISA IRQ 0 is actually GSI 2, active-low, level-triggered") | 🟡 Timer may be on wrong GSI |
+| **Timer source** | PIT only (channel 0, vector 32 via GSI 2) | LAPIC timer or HPET | 🟢 PIT works via IOAPIC GSI 2 routing |
+| **NMI routing** | LINT1 = NMI ✅ | Same | 🟢 OK |
+| **PIC IMR after remap** | Serial log: `PIC: remapped IMR master=0xf0 slave=0xeb` — several IRQs unmasked! | All masked before IOAPIC takes over | 🟠 Unmasked PIC IRQs during transition window |
+
+### The PIC IMR Issue
+
+The serial log shows PIC master IMR = `0xF0` and slave IMR = `0xEB`. In binary:
+- Master: `11110000` → IRQ 0-3 **unmasked** (timer, keyboard, cascade, COM2)
+- Slave: `11101011` → IRQ 12, IRQ 10 **unmasked** (PS/2 mouse, and one more)
+
+These are unmasked BEFORE the IOAPIC is configured. If any of these fire during the `acpi_init()` → `lapic_init()` window, they'll hit the PIC-remapped vectors (32-47) which may or may not have handlers installed yet.
+
+---
+
+## 7. Build & Runtime Configuration Gaps
+
+### Compiler Flags
+
+[build.bat:62](file:///d:/1os-copy/backup/1os/build.bat#L62):
+
+```
+-ffreestanding -mno-red-zone -mno-mmx -O2 -mcmodel=large
+```
+
+| Flag | Correct? | Notes |
+|------|----------|-------|
+| `-ffreestanding` | ✅ | Required for OS kernel |
+| `-mno-red-zone` | ✅ | Mandatory for x86-64 kernel (interrupt handlers clobber red zone) |
+| `-mno-mmx` | ⚠️ | Also need `-mno-sse` if SSE is initialized manually, but kernel does FPU/SSE init early so this is fine |
+| `-O2` | ✅ | Standard optimization level |
+| `-mcmodel=large` | ⚠️ | Every address load becomes a 64-bit `movabs`. This is safe but generates larger, slower code. Linux uses `-mcmodel=kernel` (addresses in the top 2GB). PureOS's kernel is linked at 0xC0100000 which fits in `kernel` model. |
+
+### UEFI Bootloader Compilation
+
+[build.bat:105](file:///d:/1os-copy/backup/1os/build.bat#L105):
+
+```
+x86_64-w64-mingw32-gcc -mno-red-zone -mwindows -e efi_main -nostdlib "-Wl,--subsystem,10"
+```
+
+- **Missing `-ffreestanding`** — the compiler may generate calls to `memcpy`/`memset` from libc that aren't available. Currently the bootloader defines its own `memcpy`/`memset`, so this works, but it's fragile.
+- **No optimization flag** — defaults to `-O0`. Debug-quality code in the bootloader is fine for correctness but may be slower.
+
+### QEMU vs Real Hardware Differences
+
+[run_os.bat](file:///d:/1os-copy/backup/1os/run_os.bat):
+
+```
+-m 4G -accel tcg -cpu qemu64,+smep,+smap
+-device qemu-xhci,id=xhci -device usb-kbd,bus=xhci.0
+```
+
+| Aspect | QEMU | Real LOQ | Impact |
+|--------|------|----------|--------|
+| **RAM** | 4GB | 8-16 GB | Higher RAM → kernel loaded at different physical address → exposes `kmalloc_ap` bug |
+| **xHCI** | `qemu-xhci` (no BIOS legacy) | Intel/AMD xHCI (BIOS legacy emulation active) | USBLEGSUP handoff is critical on real HW |
+| **CPU** | `qemu64` (TCG) | Real Intel (speculative execution, strict cache coherency) | MMIO caching bugs hidden in TCG |
+| **PCIe** | Simple config via 0xCF8 | ECAM at MMIO address from MCFG | Legacy I/O ports work for Bus 0, but ECAM is preferred |
+| **Memory map** | Simple: big conventional block at low addr | Complex: MMIO holes, ACPI regions, reserved areas scattered throughout | Blind 1GB map is dangerous |
+| **SMM** | No SMM emulation | Full SMM (TPM, BIOS settings, power management) | SMI can fire at any time and steal cycles |
+
+---
+
+## 8. Detailed Root Cause Analysis
+
+### Most Likely Crash Sequence on Real LOQ
+
+```mermaid
+flowchart TD
+    A[UEFI boots PureOS<br>Kernel at phys 0x1800000] --> B[kernel_main reached ✅]
+    B --> C[heap_init at virtual 0xC4000000<br>= phys 0x5800000]
+    C --> D[paging_init calls kmalloc_ap<br>for new PML4, PDPT, PD, PT]
+    D --> E["kmalloc_ap returns phys = virt - 0xC0000000<br>= 0x4001000 ❌ (should be 0x5801000)"]
+    E --> F[New page tables contain<br>WRONG physical addresses]
+    F --> G["CR3 switch to new page tables<br>(paging.c:248)"]
+    G --> H{First memory access<br>after CR3 switch}
+    H -->|Phys addr happens to be RAM| I[Reads garbage from<br>wrong memory location]
+    H -->|Phys addr is MMIO hole| J[Page fault or<br>bus error → triple fault]
+    H -->|Phys addr is reserved| K[Corrupts firmware state<br>→ SMM crash]
+    I --> L[Silent corruption:<br>kernel runs with wrong mappings<br>until something critical is accessed]
+    L --> M[xHCI MMIO mapping fails<br>→ reads from wrong physical addr<br>→ freeze or triple fault]
+```
+
+### Why QEMU Works
+
+In QEMU with 4GB RAM:
+1. Kernel is typically loaded at `0x100000` (first available 2MB-aligned slot)
+2. `kernel_phys_base = 0`
+3. Bootloader maps `0xC0000000 → physical 0`
+4. `kmalloc_ap`'s `aligned - 0xC0000000` is **accidentally correct** (virtual 0xC4001000 - 0xC0000000 = phys 0x4001000 ✅)
+5. The identity map at 0–1GB is all conventional RAM (QEMU has no MMIO holes below 1GB except the PCI hole at 0xE0000000+)
+6. xHCI is `qemu-xhci` with no BIOS legacy support → no USBLEGSUP → no SMI interaction
+
+### Why Real LOQ Crashes
+
+1. With 8+ GB RAM, UEFI places kernel at `0x1800000` or higher
+2. `kernel_phys_base = 0x1800000`
+3. `kmalloc_ap` physical addresses are off by 0x1800000
+4. Page tables point at wrong physical memory
+5. After CR3 switch in `paging_init()`, the CPU uses broken page tables
+6. Any memory access through the new tables is a gamble
+7. The 1GB identity map includes MMIO holes that are Write-Back cached → cache coherency violations
+8. The xHCI MMIO mapping at 0x200000000 is built on top of broken `kmalloc_ap` → MMIO reads return garbage
+9. Triple fault or silent corruption → system hangs
+
+---
+
+## 9. Specific Fix Recommendations (Ordered by Priority)
+
+### Fix 1: `kmalloc_ap` Physical Address Calculation 🔴
+
+**The fix**: Store `kernel_phys_base` as a global and use it in `kmalloc_ap`:
+
+```diff
+// heap.c
++extern uint64_t kernel_phys_base_global;
+
+ void *kmalloc_ap(size_t size, uint32_t *phys) {
+     void *ptr = kmalloc(size + 4096);
+     if (!ptr) return 0;
+     uint32_t addr = (uint32_t)(uintptr_t)ptr;
+     uint32_t aligned = (addr + 0xFFF) & ~0xFFF;
+     if (phys) {
+-        *phys = aligned - 0xC0000000;
++        *phys = aligned - 0xC0000000 + (uint32_t)kernel_phys_base_global;
+     }
+     return (void *)(uintptr_t)aligned;
+ }
+```
+
+**Set `kernel_phys_base_global`** early in `kernel_main()` by reading it from the bootloader's page tables (the same code that's already in `paging_init()` lines 106–124, but before heap is used).
+
+### Fix 2: Memory-Map-Aware Paging 🔴
+
+Instead of blindly mapping 0–1GB, consult the UEFI memory map:
+
+```diff
+-for (uint64_t i = 0; i < 0x40000000; i += 0x1000) {
+-    page_t *page = get_page(i, 1, kernel_pml4);
+-    page->present = 1;
+-    page->rw = 1;
+-    page->frame = i >> 12;
+-}
++// Only map EfiConventionalMemory and EfiLoaderData regions as WB
++// Map EfiACPIReclaimMemory as read-only
++// Map EfiMemoryMappedIO as UC (pcd=1, pwt=1)
++// Skip EfiReservedMemoryType, EfiACPINVS (map on demand)
+```
+
+### Fix 3: PAT/Cache Attributes for MMIO 🟠
+
+Program the PAT MSR and set proper PTE bits:
+
+- **LAPIC (0xFEE00000)**: Strong Uncacheable (UC) — PCD=1, PWT=1
+- **IOAPIC (0xFEC00000)**: UC
+- **Framebuffer**: Write-Combining (WC) — requires PAT entry
+- **xHCI MMIO**: UC (already has `pcd=1`, but should also set `pwt=1`)
+
+### Fix 4: Call `_PIC(1)` After IOAPIC Init 🟡
+
+```c
+// After IOAPIC is configured:
+ACPI_OBJECT arg = { .Type = ACPI_TYPE_INTEGER, .Integer.Value = 1 }; // IOAPIC mode
+ACPI_OBJECT_LIST args = { .Count = 1, .Pointer = &arg };
+AcpiEvaluateObject(NULL, "\\_PIC", &args, NULL);
+```
+
+### Fix 5: Register Real ACPI SCI Handler 🟡
+
+```c
+ACPI_STATUS AcpiOsInstallInterruptHandler(UINT32 IntNum,
+    ACPI_OSD_HANDLER Routine, void *Ctx) {
+    register_interrupt_handler(IntNum + 32, (void*)Routine);
+    // Unmask in IOAPIC
+    return AE_OK;
+}
+```
+
+### Fix 6: Multi-Bus PCI Scan 🟡
+
+Walk PCI-to-PCI bridges (Header Type 1) to discover subordinate buses:
+
+```c
+for (uint16_t bus = 0; bus < 256; bus++) {
+    // ...existing scan...
+    // If header type is 0x01 (PCI-PCI bridge):
+    uint8_t secondary_bus = pci_config_read_byte(bus, dev, func, 0x19);
+    // Recursively scan secondary_bus
+}
+```
+
+---
+
+## 10. Quick Diagnostic Test (No Code Changes Required)
+
+To confirm the `kmalloc_ap` bug is the root cause on real hardware, add this **one-time diagnostic** to the serial output in `paging_init()` after the CR3 switch:
+
+1. Print the value of `kernel_phys_base` (already done ✅)
+2. Print the physical address returned by a test `kmalloc_ap(4096, &test_phys)` call
+3. Compare: if `test_phys != heap_virtual_addr - 0xC0000000 + kernel_phys_base`, you've confirmed the bug
+
+The serial log already shows `kernel_phys_base = 0x1800000` in QEMU. On real hardware (if you could capture serial), it would show a different value, and the discrepancy would be visible.
+
+---
+
+## Appendix A: File Cross-Reference
+
+| File | Role | Critical Bugs |
+|------|------|---------------|
+| [boot.c](file:///d:/1os-copy/backup/1os/src/boot/uefi/boot.c) | UEFI bootloader | None (correct) |
+| [kernel.c](file:///d:/1os-copy/backup/1os/src/kernel/kernel.c) | Kernel init sequence | Init order OK |
+| [paging.c](file:///d:/1os-copy/backup/1os/src/kernel/hal/paging.c) | Page table setup | 🔴 Blind 1GB map, no cache attrs |
+| [heap.c](file:///d:/1os-copy/backup/1os/src/kernel/heap.c) | Heap allocator | 🔴 `kmalloc_ap` phys calc wrong |
+| [heap.h](file:///d:/1os-copy/backup/1os/src/kernel/heap.h) | Heap constants | Heap starts at 64MB default |
+| [memmap.c](file:///d:/1os-copy/backup/1os/src/kernel/memmap.c) | Memory map parser | Correctly clamps to 1GB ✅ |
+| [pci.c](file:///d:/1os-copy/backup/1os/src/drivers/pci.c) | PCI enum + xHCI | 🟠 Bus 0 only; xHCI mapping uses broken kmalloc_ap |
+| [acpi.c](file:///d:/1os-copy/backup/1os/src/kernel/acpi.c) | ACPICA init | 🟡 Missing `_PIC`, `_INI`, EC |
+| [acpi_osl.c](file:///d:/1os-copy/backup/1os/src/kernel/hal/acpi_osl.c) | ACPI OS layer | 🟡 Fake SCI handler install |
+| [hal.c](file:///d:/1os-copy/backup/1os/src/kernel/hal/hal.c) | HAL init sequence | 🟡 PIC init before IOAPIC |
+| [apic.c](file:///d:/1os-copy/backup/1os/src/kernel/hal/apic.c) | LAPIC/IOAPIC | Correct implementation ✅ |
+| [xhci.rs](file:///d:/1os-copy/backup/1os/rust/src/xhci.rs) | Rust xHCI driver | Correct implementation ✅ |
+| [linker.ld](file:///d:/1os-copy/backup/1os/linker.ld) | Linker script | VMA=0xC0100000, LMA=0x100000 ✅ |
+| [build.bat](file:///d:/1os-copy/backup/1os/build.bat) | Build config | Missing `-ffreestanding` on UEFI bootloader |
+| [run_os.bat](file:///d:/1os-copy/backup/1os/run_os.bat) | QEMU config | Hides bugs by using simple memory layout |
+
+## Appendix B: Linux Source Cross-Reference
+
+| Linux File | Relevant Function | What It Does That PureOS Doesn't |
+|------------|-------------------|----------------------------------|
+| `arch/x86/boot/compressed/eboot.c` | `efi_main()` | EFI stub with proper memory map handling |
+| `arch/x86/kernel/head_64.S` | `startup_64` | Early page table setup with correct phys/virt offset |
+| `arch/x86/mm/init.c` | `init_mem_mapping()` | Memory-map-aware page table construction |
+| `arch/x86/mm/pat/set_memory.c` | `pat_init()` | PAT MSR programming for cache control |
+| `arch/x86/kernel/apic/io_apic.c` | `setup_IO_APIC()` | Full IOAPIC setup with ISA override handling |
+| `drivers/usb/host/pci-quirks.c` | `quirk_usb_handoff_xhci()` | BIOS-to-OS xHCI handoff with SMI disable |
+| `drivers/acpi/bus.c` | `acpi_bus_init()` | `_OSC`, `_PIC`, `_INI` evaluation |
+| `drivers/pci/probe.c` | `pci_scan_child_bus()` | Recursive multi-bus PCI enumeration |
+
+---
+
+> [!CAUTION]
+> **The #1 fix (`kmalloc_ap`)** is almost certainly the root cause. Every page table allocation after `heap_init()` gets the wrong physical address, making the CR3 switch in `paging_init()` load garbage page tables. This is a **silent, total memory corruption** that only manifests on real hardware where `kernel_phys_base ≠ 0`. Fix this first, and many downstream issues (xHCI mapping, ACPI table access above 1GB) will resolve automatically.
