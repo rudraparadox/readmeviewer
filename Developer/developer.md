@@ -1,569 +1,629 @@
-# SBOM-Gen — Developer's Guide
+# PureOS vs Linux: Real Hardware Boot Analysis (Lenovo LOQ)
 
-**SIH 2024 · Problem Statement 1449 · NTRO (National Technical Research Organisation)**
-
-> This document is written the way I (the developer) talk about the project — plain words,
-> no over-explaining. Read it once and you'll understand what we built, how it works end to
-> end, and which technology is doing what. That's also everything you need to answer judges.
+**Date:** 2026-08-26
+**Goal:** Understand exactly WHY PureOS crashes on real Lenovo LOQ hardware while Linux boots fine, by comparing every critical subsystem step-by-step.
 
 ---
 
-## 1. What we built (one line)
+## Executive Summary
 
-SBOM-Gen is a tool that takes any software project (a zip, a folder, a GitHub link) and
-automatically produces its **Software Bill of Materials (SBOM)** — the machine-readable
-"ingredients list" of every third-party library it uses — checks those libraries against known
-**vulnerabilities**, tells you **exactly how to fix them**, and exports everything in the
-government-standard formats, all while working **fully offline**.
-
-### Why does this matter? (the 30-second story)
-
-- ~80–90% of a modern application is not your code — it's open-source libraries.
-- These libraries get security holes (CVEs) discovered over time.
-- If you don't know *exactly which version* of *which library* is inside your software, you
-  can't know if you're vulnerable.
-- Governments and agencies now **require** an SBOM for software they buy or build.
-- NTRO added one extra twist: the tool must work **offline**, because classified environments
-  can't reach public vulnerability databases over the internet.
-
-So our job: **automatically list everything, red-flag what's dangerous, show how to fix it,
-and make the official SBOM file — all offline.**
+PureOS crashes on the Lenovo LOQ while Linux boots because of **multiple compounding gaps** across the UEFI-to-kernel handoff, memory management, PCI enumeration, and xHCI ownership. The most likely crash causes are ranked at the end of this document.
 
 ---
 
-## 2. The big picture — how one scan flows
+## AREA 1: UEFI Boot → Kernel Handoff
 
-Think of the whole tool as an assembly line. One scan goes through these stages, top to bottom:
+### PureOS (`src/boot/uefi/boot.c:589-679`)
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│  REACT DASHBOARD  (frontend/, Vite)                          │
-│  Upload zip / folder / GitHub URL  →  shows results visually │
-└──────────────────────────┬──────────────────────────────────┘
-                           │ REST API calls (JSON)
-┌──────────────────────────▼──────────────────────────────────┐
-│  FASTAPI BACKEND  (backend/, Python)                         │
-│  POST /api/scan  → starts a background job → returns job id  │
-│  GET  /api/scan/{id} → poll status + result                  │
-└──────────────────────────┬──────────────────────────────────┘
-     ┌─────────────┬───────┴─────────┬───────────────┬──────────┐
-     ▼             ▼                 ▼               ▼          ▼
- ┌──────────┐ ┌──────────┐   ┌───────────┐   ┌───────────┐  ┌───────────┐
- │ detect   │ │ parsers  │   │ vuln/     │   │ context/  │  │ sbom/     │
- │ which    │ │ read     │   │ osv.py    │   │ analyzer  │  │ generator │
- │ package  │ │ lock     │   │ seed_data │   │ CVSS, fix │  │ CycloneDX │
- │ managers │ │ files    │   │ offline   │   │ command,  │  │ + SPDX    │
- │ are used │ │ → 18+    │   │ + live OSV│   │ anomalies │  │ 2.3 / 3.0 │
- │          │ │ formats  │   │ SQLite    │   │ reachable │  │           │
- └──────────┘ └──────────┘   └───────────┘   └───────────┘  └───────────┘
+| Step | PureOS | Linux efi_stub | Gap |
+|------|--------|----------------|-----|
+| ExitBootServices retry | Retries up to 4x with fresh memory map (`boot.c:646-654`) | Retries with exponential backoff + validates key | Adequate |
+| Post-EBS memory map | Stores raw EFI memory descriptors for kernel (`boot.c:585-587`) | Converts to E820 and also preserves UEFI runtime services | **Missing UEFI runtime services** |
+| GDT setup | 3-entry GDT (null, code, data) at `boot.c:392-404`, loaded before jump | Full GDT with TSS from early boot | Adequate for handoff |
+| CR3 switch | Sets CR3 and jumps to `kernelAddr` (`boot.c:675-679`) | Same | OK |
+| Memory map at low address | Forces mmap buffer below 1GB (`boot.c:562-580`) | Uses EFI memory map in high memory | Adequate |
+
+### Detailed Walkthrough
+
+**PureOS ExitBootServices flow (`boot.c:549-655`):**
+
+1. Calls `GetMemoryMap` to get size, then allocates the map buffer at a fixed low address (`boot.c:562-580`). It tries several candidate addresses (`0x3000000`, `0x2800000`, etc.) below 1GB so the kernel can read it through its identity map.
+2. Calls `GetMemoryMap` a second time to fill the buffer (`boot.c:583`).
+3. Stores the map address, entry count, and entry size in `boot_info_t` at `0x6000` (`boot.c:585-587`).
+4. Calls `ExitBootServices(ImageHandle, mapKey)` (`boot.c:642`).
+5. If it fails, retries up to 4 times with a fresh `GetMemoryMap` + `ExitBootServices` (`boot.c:646-654`).
+
+**What Linux does differently:**
+- Linux's `efi_stub` preserves UEFI runtime service pointers so the kernel can call `SetVirtualAddressMap()` later.
+- Linux converts the EFI memory map into an E820-style map for the kernel's page table builder.
+- Linux validates the memory map key more carefully and handles `EFI_CONVENTIONAL_MEMORY` vs `EFI_RESERVED_TYPE` vs `EFI_ACPI_RECLAIM_MEMORY` distinctly.
+
+**Verdict: LOW RISK.** The handoff itself is reasonable. The gap is that UEFI runtime services are not preserved, but this does not cause early boot crashes. The memory map is passed to the kernel successfully.
+
+---
+
+## AREA 2: Early Memory / Paging
+
+### Bootloader Page Tables (`src/boot/uefi/boot.c:78-125`)
+
+PureOS uses **2MB huge pages** for the initial identity map:
+
+```c
+// boot.c:106-108 — Identity map first 1GB
+for (int i = 0; i < 512; i++) {
+    ((UINT64*)pd_low)[i] = (i * 0x200000) | 0x83; // Present, R/W, 2MB
+}
 ```
 
-In plain words, the same pipeline is:
+**Gap 1: No cache attributes (PAT/PWT/PCD).**
+The `0x83` flags mean Present + RW + PageSize. Linux sets `PWT=0, PCD=0, PAT=0` for normal memory but uses `PCD=1` or write-combining for MMIO. PureOS marks everything the same.
 
-1. **You give it something to scan** — a zip file, a server folder path, or a GitHub URL.
-2. **It finds the "receipts"** — lock files like `package-lock.json`, `requirements.txt`,
-   `pom.xml`, `Cargo.lock` that record exactly what was installed and at which version.
-3. **It builds the ingredient list** — every library becomes a *component* with name, exact
-   version, package URL (purl), integrity hashes, and whether it's a direct dependency (you
-   asked for it) or transitive (it came inside something else).
-4. **It also reads compiled binaries** — wheels, JARs, `.exe`/`.dll`, `.so` — and pulls out
-   their metadata, so shipped artifacts land in the SBOM even with no source.
-5. **It looks inside your actual code** — reads import statements to decide *reachability*
-   (is the vulnerable library actually used?) and find *shadow dependencies* (imported but
-   not declared anywhere).
-6. **It checks every ingredient against vulnerabilities** — a bundled offline dataset + the
-   live OSV API, cached in SQLite.
-7. **It adds context and red flags** — CVE ID, CVSS score, severity, CISA Known-Exploited /
-   malicious markers, reachability, and the exact upgrade command.
-8. **It generates the official SBOMs** — CycloneDX 1.5 and SPDX 2.3/3.0 JSON, with the
-   vulnerabilities and hashes embedded inside the file.
-9. **You see it in the dashboard** — summary cards, an interactive dependency graph (vulnerable
-   nodes glow red), a searchable table, an anomaly feed, and one-click exports (CycloneDX,
-   SPDX, HTML report, PDF report).
+**Gap 2: LFB mapping overlap.**
+The bootloader maps the framebuffer at `0xE0000000` (PDPT[3], PD index 256) using 2MB pages (`boot.c:116-122`). This occupies the same PDPT slot (index 3) as the `0xC0000000` higher-half kernel mapping. The code writes to `pd_high[256+i]` which maps `0xE0000000` → `0xC0000000 + 256*2MB` through `pd_high`. This is intentional (the 128MB block starting at `0xC0000000` covers both kernel and LFB), but it means the kernel's higher-half mapping covers `0xC0000000` through `0xE8000000` — a 640MB region all mapped via the same page directory.
 
----
+### Kernel Page Tables (`src/kernel/hal/paging.c:72-249`)
 
-## 3. The tech stack — what each piece does
+**Gap 3: Identity map uses 4KB pages but no PAT/PCD control.**
 
-| Layer | Technology | What it actually does for us |
-|---|---|---|
-| Backend API | **Python + FastAPI** | The server. Receives scan requests, runs them in background threads, serves results as JSON. |
-| Data models | **Pydantic** | Defines the `Component`, `Vulnerability`, `Anomaly`, `ScanResult` objects — typed and validated. `models.py`. |
-| Frontend | **React + Vite** | The web dashboard users interact with. Vite is the build tool that bundles it into static files. |
-| Dependency graph | **d3-hierarchy** | Draws the interactive dependency tree. Red nodes = vulnerable. No force-layout library — we build a hierarchy tree manually. |
-| CycloneDX output | **cyclonedx-python-lib** | The *official* library for generating standards-compliant CycloneDX JSON — we never hand-roll the schema. |
-| SPDX output | hand-built JSON | We build SPDX 2.3 / 3.0 ourselves so we can embed vulnerabilities, file hashes, and relationships exactly how we want. |
-| Persistence | **SQLite** | One file database. Stores scan history, the OSV API cache, Maven resolution cache, user accounts, audit log. No DB server to install. |
-| Vulnerability data | **OSV API (live) + bundled `seed_data.json` (offline)** | OSV is Google's public vulnerability database. The bundled file has ~836 curated advisories across 8 ecosystems — this is what makes offline mode work. |
-| PDF reports | **reportlab** | Generates the A4 printable executive PDF report. |
-| Packaging | **PyInstaller** | Bundles everything (Python + built React app) into a single `.exe` — no installs needed. |
-| Desktop shell | **pywebview** | Wraps the web app in a native window (EdgeChromium) so double-clicking the exe opens the app like a desktop program. |
-| Auth | **JWT + bcrypt** | Multi-organisation accounts, roles (admin/analyst/viewer), API tokens, audit log. |
-
-### The two clever bits worth remembering
-
-- **Offline mode:** all the CVE data ships *inside* the tool (the `seed_data.json`), so version
-  matching, severity scoring, and fix commands all work with zero internet. This is the NTRO
-  requirement.
-- **Standards, not guesses:** CycloneDX uses the official library; SPDX is hand-built but
-  deterministic. Both embed the vulnerabilities and hashes *inside* the SBOM file, so the file
-  alone tells the whole security story.
-
----
-
-## 4. How the scan works, module by module
-
-All backend code lives under `backend/app/`. This is the part to know cold.
-
-### 4.1 Input handling — `api/routes.py` + `scanner/runner.py`
-
-The API accepts the input and kicks off a background job:
-
-- `POST /api/scan` accepts a **zip file**, a **folder path**, a **GitHub URL** (and Docker
-  image names). It figures out which one you meant and returns a `job_id` immediately.
-- The scan runs in a **daemon thread**, so a repo with 2,000+ dependencies doesn't block the
-  server. The UI polls `GET /api/scan/{id}` every 1.5 s until the status is `complete`.
-- Zip uploads are extracted with **zip-slip protection** — it resolves every member path and
-  refuses anything that would escape the destination folder.
-- GitHub repos are fetched with a shallow `git clone --depth 1`.
-- Results are stored in **SQLite** (`jobs.db`), so scan history survives a restart.
-- The uploaded source is persisted too, so the **code browser** in the UI keeps working later.
-
-### 4.2 Ecosystem detection & lock-file parsing — `scanner/`
-
-This is the heart of the tool. First `node.detect()` walks the folder and recognises lock-file
-names. Whatever it finds tells us which package managers the project uses — a project can use
-several at once (a Python backend + a JS frontend), and we scan **all of them in parallel**.
-
-Then the dispatcher (`runner.py`) picks the *most authoritative* file per ecosystem (lock files
-over plain manifests, because lock files have exact resolved versions). There's one parser per
-ecosystem:
-
-| File | Ecosystem |
-|---|---|
-| `node.py` | npm — `package-lock.json` (v1/v2/v3), `yarn.lock` (v1/v2), `pnpm-lock.yaml`, `package.json` |
-| `python_parser.py` | pypi — `requirements.txt`, `poetry.lock`, `Pipfile.lock`, `pyproject.toml`, `setup.py` |
-| `maven_resolver.py` + `java_parser.py` | Java Maven — `pom.xml` (resolves the full transitive tree) |
-| `go_parser.py` | Go — `go.mod` + `go.sum` (integrity hashes) |
-| `cargo_parser.py` | Rust — `Cargo.lock` |
-| `composer_parser.py` | PHP — `composer.lock` |
-| `bundler_parser.py` | Ruby — `Gemfile.lock` |
-| `nuget_parser.py` | .NET — `packages.lock.json`, `project.assets.json` |
-| `gradle_parser.py` | Gradle — `build.gradle(.kts)` + version catalogs |
-| `podfile_parser.py` | iOS — `Podfile.lock` |
-| `conan_parser.py`, `conda_parser.py`, `vcpkg_parser.py`, `linux_parser.py` | C/C++ and OS packages |
-| `docker_parser.py` | Docker images (OS packages + lock files inside) |
-
-What every parser captures per library: **name**, **exact version**, **purl**, **hashes**,
-**direct/transitive/dev flags**, and **dependency edges** (who depends on whom). Two parsers
-worth bragging about:
-
-- **Maven** is the most powerful — it assembles the *effective POM* (inheritance, `${}`
-  properties, `dependencyManagement`, imported BOMs), resolves the **full transitive tree**
-  with nearest-wins conflict resolution, and can fetch parent POMs from Maven Central
-  (SQLite-cached) or use a bundled offline tree.
-- **Python** parses `setup.py` with Python's own **AST parser** — it reads the code structure
-  but *never executes* your setup script (that would be a security risk).
-
-### 4.3 Binary artifacts — `scanner/binary_parser.py`
-
-Some projects ship already-built binaries without full source. We read those directly:
-
-- **Python wheel** (`.whl`) → reads the embedded `.dist-info/METADATA` for name/version + deps.
-- **Java JAR** (`.jar`) → reads `META-INF/maven/*/pom.properties` + embedded `pom.xml`.
-- **Windows PE** (`.exe/.dll`) → reads the **import table** to list linked DLLs (filtering OS
-  noise like `kernel32.dll`). Uses the `pefile` library.
-- **Linux ELF** (`.so/.elf`) → reads `DT_NEEDED` entries for linked shared libraries
-  (hand-implemented parser).
-
-Each binary gets a **SHA-256 file hash**, and its extracted dependencies are linked back as
-children.
-
-### 4.4 Source / import analysis — `scanner/ast_scanner.py`
-
-We read the *actual code* to figure out what's really used. Python uses the real `ast` module;
-other languages (JS, Go, Java, C#, Ruby, Rust, PHP) use careful patterns; C/C++ maps
-`#include <openssl/ssl.h>` → `openssl`. Three outputs:
-
-1. **Reachability** — if a vulnerable library is in the tree but your code never imports it,
-   the risk is lower. We mark it *reachable* or not, with the exact `file:line`.
-2. **Shadow dependencies** — imported in code but not declared in any manifest. A red flag
-   (could be a hijacked package) — flagged MEDIUM and still CVE-scanned.
-3. **Unused dependencies** — declared but never imported — flagged LOW.
-
-### 4.5 Vulnerability engine — `vuln/osv.py` + `vuln/seed_data.json`
-
-Every `name@version` is checked against two sources:
-
-1. **Bundled offline dataset** (`seed_data.json`) — ~836 curated advisories across 8 ecosystems
-   (npm, PyPI, Maven, RubyGems, Go, Packagist, crates.io, NuGet). **This is what makes offline
-   mode work.** Real CVE numbers live in the `aliases` field (e.g. a `GHSA-...` advisories a
-   `CVE-2020-28500`).
-2. **Live OSV API** — Google's public database, queried at scan time with an 8-thread pool.
-   Every result is cached in **SQLite**, so repeat scans are instant and network-light.
-
-**Version matching is precise:** each advisory declares an *introduced* version (first affected,
-inclusive) and a *fixed* version (safe, exclusive). If your version sits in that window, you're
-vulnerable. Severity comes from **CVSS** (CRITICAL ≥ 9.0, HIGH ≥ 7.0, MEDIUM ≥ 4.0, LOW > 0),
-with a fallback to GitHub/npm labels when no CVSS exists. **KEV** (CISA Known-Exploited) and
-**malicious** (`MAL-` prefix) flags are attached per vulnerability.
-
-### 4.6 Context analyzer — `context/analyzer.py`
-
-Knowing "you have a vulnerability" is only half the job. This module adds the actionable part:
-
-- **Fix command** per ecosystem: Python → `pip install --upgrade requests>=2.32.0`,
-  Node → `npm install lodash@4.17.21`, Go → `go get ...@v1.2.3`, Rust →
-  `cargo update -p serde --precise 1.0.200`, etc.
-- **Red-flag anomalies** it hunts for:
-  - **Typosquatting** — name ~80% similar to a popular package (`reqests` vs `requests`).
-  - **Unpinned version** — `*`, `^1.0`, `>=2.0` (you don't know what you'll get).
-  - **Dependency confusion** — `file:`/`workspace:`/`git+` prefixes or a name missing from the
-    public registry.
-  - **Unmaintained** — no release in 2+ years (HIGH if 5+).
-  - **Suspicious provenance** — published ≤90 days and not popular.
-  - **Deprecated / yanked** packages.
-  - **Version drift** — same direct package at multiple versions.
-  - **Copyleft license conflict** — AGPL/SSPL/GPL inside a permissive project.
-- Final **stats** power the dashboard cards (totals, vulnerable counts, health score, etc.).
-
-### 4.7 SBOM generation — `sbom/generator.py`, `sbom/spdx30.py`
-
-Emits the official files:
-
-- **CycloneDX 1.5** — built with the official `cyclonedx-python-lib` (never hand-rolled).
-  Includes purls, hashes, licenses, direct/dev scope, a root dependency linking every direct
-  component, and **embedded `Vulnerability` objects** (CVSS rating, "Fixed in X" recommendation,
-  KEV/malicious/reachable flags).
-- **SPDX 2.3** — one package element per component with checksums, `externalRefs` (purl +
-  license), `DEPENDS_ON` relationships, vulnerabilities linked via `AFFECTS`, and every project
-  file `CONTAINS`-ed with SHA-256 hashes.
-- **SPDX 3.0** — next-gen JSON-LD format.
-
-`hashing.py` computes SHA-256 + SHA-1 for every project file (capped at 2 MiB/file and 20,000
-files to stay fast).
-
-### 4.8 Reports — `report/generator.py`, `report/pdf.py`
-
-Executive-friendly outputs: a **Supply-Chain Health Score** circle, severity bar, stat cards,
-a vulnerability findings table (with CVE links, flag badges, "Used In file:line", "Fixed In",
-remediation command), anomaly table, full component inventory, and license summary.
-
-**Health score formula:** `100 − 30×(critical) − 12×(high) − 5×(medium) − 2×(low)`, clamped 0–100.
-
-### 4.9 Policy + CLI — `policy/engine.py`, `backend/sbomgen.py`
-
-Two ways the tool gates a pipeline:
-
-- **Policy engine:** admin rules like `max_severity`, `max_vulnerabilities`, `fail_on_kev`,
-  `fail_on_malicious`, blocked packages, blocked/allowed licenses. Each scan gets a
-  `passed`/`failed` verdict. Default policy blocks CRITICAL, any vulns, KEV, malicious, and
-  AGPL/SSPL licenses.
-- **CLI:** `python -m sbomgen scan <folder|zip|github-url> --format cyclonedx -o sbom.json`.
-  `--fail-on <severity>` **exits with code 2** when the worst vulnerability crosses the
-  threshold — so the CI build fails. Exit codes: 0 = success, 1 = scan error, 2 = gate tripped.
-
-### 4.10 Auth — `auth/`
-
-Multi-organisation accounts. Passwords are bcrypt-hashed, login uses JWTs (12-hour expiry),
-users get roles (admin/analyst/viewer), admins manage users and API tokens, and every important
-action is written to an audit log. Each org only sees its own scans.
-
-### 4.11 Frontend dashboard — `frontend/src/`
-
-The UI is a React single-page app with these views:
-
-- **Summary cards** — totals, vulnerable counts, reachable vulns, KEV count, anomalies, an
-  animated health-score ring, severity bar.
-- **Dependency graph** — interactive tree built with `d3-hierarchy`. Vulnerable nodes glow red,
-  attack paths from root to a vulnerable node are highlighted, zoom/pan/expand/collapse.
-- **Components table** — searchable + filterable by severity, ecosystem, type, and
-  vulnerable-only.
-- **Context panel** — click any component: used-in-code locations, parent/child relationships,
-  hashes, and each vulnerability with CVSS + the copy-paste fix command.
-- **Code browser** — browse the uploaded source; vulnerable lines marked with severity colors.
-- **Anomalies / Licenses / Binaries tabs** — red-flag feed, license compliance, extracted
-  binaries.
-- **Scan history** — compare (diff) two scans: added/removed components, new/resolved
-  vulnerabilities, before/after score.
-
-The built frontend (`frontend/dist`) is served directly by FastAPI, so one server serves both
-the API and the UI. In dev, Vite runs on port 5173 and proxies `/api` → `:8000`.
-
----
-
-## 5. The desktop app — how the exe works
-
-`SBOM-Gen.spec` is the PyInstaller spec. The build bundles:
-
-- the Python backend + FastAPI + all libraries,
-- the pre-built React frontend (`frontend/dist`),
-- the offline CVE dataset,
-- and an icon.
-
-When you double-click `SBOM-Gen.exe` (`backend/app/main.py` → `run()`):
-1. It starts a FastAPI server on a **free local port** (or `SBOM_PORT` if set).
-2. It waits for the health check.
-3. It opens a native window using **pywebview** (EdgeChromium), with a JS bridge that saves
-   exported SBOMs and PDFs straight to `~/Downloads`.
-4. If the native window isn't available, it falls back to opening the default browser.
-5. Logs go to `%LOCALAPPDATA%\sih1449\logs\app.log`.
-
-That's how we get a "double-click and it just works" desktop tool with no Python/Node installs.
-
----
-
-## 6. How to run it
-
-**Backend only (API + UI):**
-```powershell
-cd backend
-pip install -r requirements.txt
-python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
-# open http://127.0.0.1:8000
+```c
+// paging.c:88-97
+for (uint64_t i = 0; i < 0x40000000; i += 0x1000) {
+    page_t *page = get_page(i, 1, kernel_pml4);
+    page->present = 1;
+    page->rw = 1;
+    page->frame = i >> 12;
+    // Missing: PWT, PCD, PAT, PGE flags
+}
 ```
 
-**Frontend dev mode (hot reload):**
-```powershell
-cd frontend
-npm install
-npm run dev          # http://localhost:5173 (proxies /api → :8000)
+Every 4KB page in the 0-1GB identity map is mapped with default write-back caching. MMIO regions within this range (e.g., local APIC at 0xFEE00000, any PCI devices below 4GB) should be uncacheable but are mapped as cacheable. This can cause stale reads and deferred writes to device registers.
+
+**Gap 4: kmalloc_ap physical address is 32-bit.**
+
+```c
+// heap.h:25
+void *kmalloc_ap(size_t size, uint32_t *phys);
 ```
 
-**CLI / CI-CD:**
-```powershell
-cd backend
-python -m sbomgen scan D:\repos\my-app --offline --format cyclonedx -o sbom.json
-python -m sbomgen scan app.zip --format json
-python -m sbomgen scan https://github.com/owner/repo --format pdf -o report.pdf
-python -m sbomgen scan D:\repos\my-app --fail-on high    # exit 2 if anything >= HIGH
+The heap allocator returns physical addresses as `uint32_t`, meaning all heap allocations are forced below 4GB. On QEMU this is fine. On the Lenovo LOQ with 16GB RAM, the UEFI memory map may place `EfiConventionalMemory` starting above 4GB, meaning `memmap_init()` at `memmap.c:38-66` will find **no usable memory in the 64MB-1GB range** and fall back to defaults.
+
+The default `HEAP_START=0x4000000` (64MB) and `HEAP_SIZE=0x1C000000` (448MB) are hardcoded (`heap.h:10-11`), so the heap will exist — but only because the identity map covers 0-1GB. If UEFI firmware allocates critical structures in the 64MB-1GB range, the heap would overwrite them.
+
+**Gap 5: memmap_init() memory map parsing.**
+
+```c
+// memmap.c:41-73
+for (uint32_t i = 0; i < info->memory_map_entries; i++) {
+    // ...
+    if (info->boot_method == BOOT_METHOD_UEFI) {
+        uint32_t *uefi_type = (uint32_t *)entry;
+        if (*uefi_type == 7) { // EfiConventionalMemory
+            usable = 1;
+            uint64_t *phys = (uint64_t *)(map + i * info->memory_map_entry_size + 8);
+            uint64_t *pages = (uint64_t *)(map + i * info->memory_map_entry_size + 24);
+            entry->base_addr = *phys;
+            entry->length = *pages * 4096;
+        }
+    }
 ```
 
-**Standalone exe:**
-```powershell
-cd frontend && npm run build
-cd ..
-python -m PyInstaller SBOM-Gen.spec --noconfirm   # -> dist\SBOM-Gen.exe
+The code assumes `EFI_MEMORY_DESCRIPTOR` layout: type at offset 0, physical address at offset 8, number of pages at offset 24. This matches the standard UEFI spec. However, it only looks for `EfiConventionalMemory` (type 7). It ignores `EfiBootServicesCode`, `EfiBootServicesData`, and `EfiReservedMemoryType` regions that might overlap with the identity-mapped range.
+
+**Gap 6: No MMIO hole awareness.**
+Linux parses the full UEFI memory map to identify reserved/MMIO regions (above 4GB PCI BARs, APIC, etc.) and skips them in page table construction. PureOS blindly identity-maps 0-1GB and then maps `0xF0000000-0xFFFFFFFF` for LAPIC/IOAPIC. If the Lenovo's MMIO layout differs (which it almost certainly does — modern Intel platforms have MMIO above 4GB), any MMIO region accessed outside these maps will page-fault.
+
+**Verdict: HIGH RISK.** The 32-bit heap + blind 1GB identity map is the most fundamental architectural limitation. While it works in QEMU, real hardware has more complex memory layouts.
+
+---
+
+## AREA 3: PCI Enumeration
+
+### PureOS (`src/drivers/pci.c:27-478`)
+
+**Gap 7: Only uses legacy I/O port 0xCF8/0xCFC.**
+
+```c
+// pci.c:27-46
+uint32_t address = (lbus << 16) | (lslot << 11) | (lfunc << 8) | (offset & 0xfc) | 0x80000000;
+outl(PCI_CONFIG_ADDRESS, address);
+tmp = inl(PCI_CONFIG_DATA);
 ```
 
-**Tests:**
-```powershell
-cd backend
-python tests\test_e2e.py          # end-to-end API tests
-python tests\test_regression.py   # severity/robustness
-python tests\test_binary.py       # binary artifact parsing
-python tests\test_cli.py          # CLI exit codes and formats
+Linux uses two methods:
+1. **Legacy I/O ports (0xCF8/0xCFC):** Same as PureOS, limited to 256-byte config space.
+2. **PCIe ECAM (Enhanced Configuration Access Mechanism):** Uses the MCFG ACPI table to get an MMIO base address, then memory-maps the entire config space. This allows access to config space up to 4096 bytes.
+
+PureOS only uses legacy I/O. This means:
+- Cannot access extended config space (registers >255).
+- Cannot efficiently enumerate large numbers of devices.
+- May miss devices that only respond to ECAM access.
+
+**Gap 8: PCI bus scan limited to bus 0.**
+
+```c
+// pci.c:427
+for (uint16_t bus = 0; bus < 1; bus++) { // BUS 0 ONLY!
 ```
 
----
+On the Lenovo LOQ (Intel chipset), PCIe root ports are on bus 0, but devices behind PCIe root ports and switches appear on buses 1-255. Linux scans all 256 buses. The xHCI controller on the LOQ may be on a non-zero bus if it is behind a root port complex.
 
-## 7. Repository map (where things live)
+**If the xHCI is on bus 1+, PureOS will never find it.**
 
-```
-backend/
-  app/
-    main.py               FastAPI entrypoint + desktop run() (pywebview)
-    models.py             Pydantic models (Component, Vulnerability, ScanResult...)
-    api/routes.py         REST endpoints + background jobs
-    api/auth_routes.py    login, users, tokens, audit log
-    scanner/              detection + per-ecosystem parsers + binary + AST
-    vuln/                 osv.py (live), cache.py (SQLite), seed_data.json (offline)
-    context/analyzer.py   severity, remediation, reachability, anomalies, stats
-    sbom/                 generator.py (CycloneDX + SPDX), spdx30.py, hashing.py
-    report/               generator.py (HTML), pdf.py (reportlab)
-    policy/               engine.py (CI/CD rules)
-    auth/                 security.py, store.py, deps.py
-  sbomgen.py              the CLI
-  tests/                  e2e, regression, binary, CLI tests
-  scripts/build_seed.py   rebuilds the offline CVE dataset (build-time)
-frontend/
-  src/App.jsx             layout, state, polling
-  src/api.js              API client + scan polling
-  src/graph.js            dependency-tree builder from a scan result
-  src/components/         Uploader, SummaryCards, DependencyGraph, ComponentTable,
-                          ContextPanel, AnomalyList, CodeBrowser, ScanHistory, ...
-samples/                  demo projects (npm-app, py-app, multi-app polyglot)
+**Gap 9: No MCFG/ECAM support.**
+Linux uses the ACPI MCFG table to get the MMIO base address for PCIe enhanced configuration access. PureOS never parses MCFG. On the Lenovo LOQ, if the xHCI controller is behind a PCIe port that only responds to ECAM, the legacy I/O port scan will miss it entirely.
+
+**Gap 10: 64-bit BAR handling.**
+
+```c
+// pci.c:157-161
+uint64_t orig_addr = (bar0 & 0xFFFFFFF0);
+if (is_64bit) orig_addr |= ((uint64_t)bar1 << 32);
 ```
 
----
+This reads the BAR correctly. But the mapping code at `pci.c:184-226` maps it to virtual `0x200000000` (8GB):
 
-## 8. Quick answers to the questions judges always ask
+```c
+// pci.c:192
+mmio_base = 0x200000000ULL;
+```
 
-**What is an SBOM?**
-The machine-readable "ingredients list" of software — every component with its version and
-integrity hash. It matters because ~90% of modern software is third-party code, and you can't
-secure what you don't know you have.
+Then creates page table entries for virtual `0x200000000` pointing to the physical BAR address:
 
-**Why lock files and not source scanning?**
-Lock files record the *exact resolved* versions actually installed, including every transitive
-dependency — the ground truth. Source only shows version ranges (`^4.0.0`), which could resolve
-to many different versions.
+```c
+// pci.c:196-215
+for (uint64_t offset = 0; offset < 0x20000; offset += 0x1000) {
+    uint64_t phys = (orig_addr & ~0xFFFULL) + offset;
+    uint64_t virt = mmio_base + offset;
+    struct { ... } *p = (void*)get_page(virt, 1, kernel_pml4);
+    if (p) {
+        p->present = 1; p->rw = 1; p->user = 0;
+        p->nx = 1; p->pcd = 1; // Uncached
+        p->frame = phys >> 12;
+    }
+}
+```
 
-**How does offline mode work?**
-All vulnerability data ships inside the tool — ~836 curated advisories across 8 ecosystems.
-Matching, severity, and fix commands all work from this local data. Online mode layers the live
-OSV API on top, cached in SQLite.
+On QEMU, this works because QEMU's virtual address space is flat. On real hardware, the xHCI MMIO BAR on the LOQ is likely at a **high physical address** (e.g., `0xFE000000` or above 4GB). The `get_page()` call should create the needed page table entries via `kmalloc_ap()`, which allocates from the heap below 1GB. This should work — but the PML4 entry for virtual `0x200000000` (PML4 index 4) needs to be created, and `get_page` with `make=1` should handle this.
 
-**What makes this different from `npm audit` / Dependabot?**
-Those are single-ecosystem vulnerability lists. Ours is a unified, polyglot tool that also
-parses binaries, emits standard SBOMs (CycloneDX/SPDX), adds reachability, typosquatting,
-license checks, an offline mode, executive reports, and a CI/CD policy gate.
+**The real problem:** After the page tables are set up, CR3 must be reloaded to flush the TLB. PureOS does this at `pci.c:218-220`:
 
-**How accurate is the version matching?**
-Advisories declare an introduced (inclusive) / fixed (exclusive) window; we compare your exact
-version from the lock file against that window numerically. Real formats verified against real
-projects.
+```c
+uint64_t cr3;
+__asm__ volatile("mov %%cr3, %0" : "=r" (cr3));
+__asm__ volatile("mov %0, %%cr3" : : "r" (cr3) : "memory");
+```
 
----
+This flushes the TLB correctly. But the issue is that the **Rust `MemoryMapper`** (`xhci.rs:8-11`) assumes identity mapping:
 
-*Full technical deep-dive: `DOCUMENTATION.md` · Plain-English overview: `PROJECT_OVERVIEW.md` ·
-Run + demo script: `README.md`*
+```rust
+unsafe fn map(&mut self, phys_base: usize, _bytes: usize) -> NonZeroUsize {
+    NonZeroUsize::new(phys_base).unwrap() // Return physical as virtual
+}
+```
 
+The `xhci::Registers::new(bar_ptr, mapper)` call in `xhci.rs:128` receives `bar_ptr` which is the virtual address `0x200000000`. The Rust `xhci` crate may internally call `mapper.map()` for its own register access calculations, receiving physical addresses and returning them as-is — but the CPU needs virtual addresses. This is a **potential virtual/physical confusion** inside the xHCI crate.
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-# Tech Stack & Libraries
-
-SBOM-Gen is a polyglot SBOM generation and vulnerability scanning tool. It combines a
-Python/FastAPI backend with a React dashboard, packaged as a single desktop exe.
+**Verdict: CRITICAL RISK.** The bus-0-only scan may miss the xHCI entirely. The MMIO mapping may work for addresses below 1GB but has virtual/physical confusion issues in the Rust layer.
 
 ---
 
-## 1. Backend — Python + FastAPI
+## AREA 4: xHCI Ownership (THE CRASH POINT)
 
-The core scanning engine and REST API live in `backend/`.
+### PureOS xHCI Init Sequence
 
-| Library | Purpose |
-|---|---|
-| **FastAPI** | REST API framework — `/api/scan`, polling, CycloneDX/SPDX/PDF export endpoints. Ships with **Pydantic** for the shared `Component`, `Vulnerability`, `ScanResult` models. |
-| **Uvicorn** | ASGI server that runs the FastAPI app (dev, and embedded inside the desktop exe). |
-| **python-multipart** | Parses the drag-and-drop zip file uploads. |
-| **requests** | HTTP client for the live **OSV API** (vulnerability lookups), PyPI/npm registry resolution, and ClearlyDefined license enrichment. |
+**Phase 1: C code discovery and handoff (`pci.c:152-401`)**
 
-### Ecosystem parsers
-Most lock-file parsing (`package-lock.json`, `yarn.lock`, `Cargo.lock`, `composer.lock`,
-`Gemfile.lock`, `packages.lock.json`, `pom.xml`, `go.mod`+`go.sum`, Gradle, Conan, vcpkg, conda,
-Podfile, dpkg) is done with **pure Python stdlib** (`json`, `re`, `ast`, `xml.etree`) — no heavy
-third-party dependencies.
+1. Detect xHCI controller: class 0x0C, subclass 0x03, progIF 0x30 (`pci.c:149-152`)
+2. Read BAR0/BAR1 to get physical MMIO address (`pci.c:157-161`)
+3. Map BAR to virtual `0x200000000` with PCD=1 (uncached) (`pci.c:184-226`)
+4. Evaluate ACPI `_OSC` on `\_SB.PCI0` (`pci.c:233-276`)
+5. Enable Bus Master + Memory Space, disable INTx (`pci.c:288-291`)
+6. Walk extended capabilities for USB Legacy Support (`pci.c:322-397`)
+7. BIOS-to-OS handoff: set OS Owned Semaphore (bit 24), poll until BIOS clears bit 16 (`pci.c:346-371`)
+8. Clear USBLEGCTLSTS to disable all SMI sources (`pci.c:375-377`)
+9. Call `rust_xhci_init(mmio_base)` (`pci.c:400-401`)
 
-| Library | Purpose |
-|---|---|
-| **cyclonedx-python-lib** | Official library for standards-compliant **CycloneDX 1.5** output — components, purls, hashes, licenses, dependency relationships and embedded vulnerabilities. Includes `packageurl` for package-URL generation. |
-| **pefile** | Reads Windows **PE** exe/dll import tables to list linked DLLs in binary artifacts. |
-| — | Linux **ELF** `DT_NEEDED` parsing and wheel/JAR metadata extraction are hand-implemented. |
-| **reportlab** | Generates the A4 **PDF** executive report. |
-| **packaging** | Semver/version-range parsing used for vulnerability range matching. |
-| **PyJWT** | JSON Web Tokens for login sessions (multi-tenant orgs, roles, API tokens). |
-| **bcrypt** | Password hashing for the auth store. |
-| **cryptography** | Ed25519 signing/verification of SBOM manifests. |
-| **pywebview** | Opens the packaged exe as a native desktop window (Edge Chromium backend) with a bridge to export files to Downloads. |
-| **sqlite3** (stdlib) | Persistence for scan jobs/history, the OSV result cache, Maven metadata cache, auth, policy and audit log — no database server needed. |
-| **cose** | Optional COSE verification for Microsoft-style signed catalogs. |
+**Phase 2: Rust xHCI driver (`xhci.rs:118-780`)**
 
-### Vulnerability data
-- **Bundled offline dataset** — `seed_data.json` with 830+ curated advisories across 8
-  ecosystems (this is what makes fully offline scans work).
-- **Live OSV API** — checked per component through a bounded thread pool, cached in SQLite.
+1. Create `xhci::Registers` from MMIO base (`xhci.rs:128`)
+2. Read capability registers, validate caplength (`xhci.rs:130-135`)
+3. **Second BIOS handoff** — "stealth takeover" (`xhci.rs:138-177`)
+4. Stop controller: clear USBCMD.RunStop (`xhci.rs:187-203`)
+5. Wait for USBSTS.HcHalted with 500ms timeout (`xhci.rs:193-203`)
+6. Reset controller: set USBCMD.HCRST (`xhci.rs:209-224`)
+7. Wait for reset complete with 1s timeout (`xhci.rs:216-224`)
+8. Wait for CNR (Controller Not Ready) to clear with 1s timeout (`xhci.rs:225-235`)
+9. Set Max Device Slots Enabled (`xhci.rs:242-250`)
+10. Allocate DCBAAP, command ring, event ring (`xhci.rs:252-313`)
+11. Configure Interrupter 0 (`xhci.rs:304-316`)
+12. Start controller (`xhci.rs:336-355`)
+13. Port scan and device enumeration (`xhci.rs:390-438`)
 
-### Standard-library highlights
-`ast` (Python import analysis for reachability), `hashlib` (SHA-1/256 file hashes),
-`concurrent.futures` + `threading` (parallel hashing/parsing, background scan jobs), `zipfile`
-(zip extraction with zip-slip protection), `subprocess` (shallow `git clone` for GitHub URLs,
-docker CLI fallback), `ctypes`/`winreg` (GPU detection + registry tweaks on Windows).
+### Critical Gaps
+
+**Gap 11: Double handoff — contradictory ownership protocol.**
+
+The C code in `pci.c:346-384` does a proper handoff:
+```c
+// Set HC OS Owned Semaphore (bit 24)
+*ext_cap = val | (1 << 24);
+// Wait for BIOS to clear its ownership bit (bit 16)
+while (timeout > 0) {
+    val = *ext_cap;
+    if (!((val >> 16) & 1)) break; // BIOS released!
+    for (volatile int d = 0; d < 100000; d++) {}
+    timeout--;
+}
+```
+
+Then the Rust code in `xhci.rs:161-170` does a "stealth takeover":
+```rust
+// Force clear BIOS Owned Semaphore (Bit 16), but DO NOT set OS Owned Semaphore (Bit 24)
+core::ptr::write_volatile(ptr as *mut u32, cap & !(1 << 16));
+// Wait ~50ms
+wait_ticks(13);
+// Clear USBLEGCTLSTS
+core::ptr::write_volatile(ctl_sts_ptr as *mut u32, 0);
+```
+
+This is **contradictory**: the C code already set the OS bit and waited for BIOS to release. The Rust code then clears the BIOS bit again and explicitly does NOT set the OS bit. On Intel platforms with SMM-based USB legacy emulation, the SMM handler monitors these bits. If the OS bit is cleared after being set, the SMM handler may interpret this as the OS relinquishing ownership, causing it to reassert BIOS control.
+
+**Gap 12: No post-handoff delay.**
+
+Linux's `xhci-pci.c` sequence:
+1. Set OS Owned Semaphore
+2. Poll until BIOS clears bit 16
+3. Disable all SMI sources in USBLEGCTLSTS
+4. **Wait 1 second** for SMM to settle
+5. Then reset the controller
+
+PureOS does steps 1-3 but **skips step 4 entirely**. The SMM handler may still be processing when PureOS resets the controller. This causes the CPU to enter SMM mid-reset, which can freeze the CPU or corrupt the OS state.
+
+**Gap 13: xHCI reset during active SMI.**
+
+If the BIOS handoff is incomplete (BIOS still owns the controller, or SMM is still processing the ownership change), writing to `USBCMD.HCRST` triggers an SMI. The SMM handler tries to service it, but the OS has already exited boot services and set up its own IDT/GDT. The SMM handler returns with corrupted OS state, causing a triple fault.
+
+**Gap 14: MMIO read failure on real hardware.**
+
+```rust
+// xhci.rs:130
+let caplength = registers.capability.caplength.read_volatile().get();
+if caplength == 0 || caplength == 0xFF {
+    // ABORT
+}
+```
+
+If the xHCI BAR is at a physical address >1GB that is not properly mapped in the page tables, `read_volatile` will page-fault. The `MemoryMapper` returns the physical address as virtual, but the actual mapping is at virtual `0x200000000`. If the `xhci` crate internally translates offsets using the mapper, it will use the wrong virtual address.
+
+**Gap 15: `rust_xhci_init` event ring uses virtual pointers for TRBs.**
+
+```rust
+// xhci.rs:1209
+let base = XHCI_KB_INT_RING as *mut u32;
+```
+
+`XHCI_KB_INT_RING` is set from `kmalloc_ap`'s virtual return value. This is correct — TRBs should be accessed via virtual addresses. But the physical address (`XHCI_KB_INT_PHYS`) is used for the TRB pointer fields that the xHCI hardware reads. This is also correct. However, the event ring base (`XHCI_EVENT_RING_BASE`) is similarly set from `kmalloc_ap`'s virtual return:
+
+```rust
+// xhci.rs:321
+XHCI_EVENT_RING_BASE = erst_seg_ptr as u64; // virtual
+```
+
+And the ERDP (Event Ring Dequeue Pointer) is set using the physical address:
+```rust
+// xhci.rs:1391
+let new_erdp = XHCI_EVENT_RING_PHYS + (idx as u64) * 16;
+```
+
+But wait — `new_erdp` is calculated from `XHCI_EVENT_RING_PHYS` which is the **physical** address of the event ring segment (4096 bytes). The ERDP should point to a TRB within the event ring segment. Each TRB is 16 bytes, so `idx * 16` is correct. But `XHCI_EVENT_RING_PHYS` is the physical base of the 4096-byte segment, and `idx * 16` must not exceed 4096. With `ring_size=256` TRBs and 16 bytes each, the max is `255 * 16 = 4080`, which fits. This is correct.
+
+However, the event ring segment table (ERST) entry 0 at `xhci.rs:299` sets the ring segment base address to the physical address of `erst_seg_ptr`:
+```rust
+erst.write_volatile(erst_seg_phys as u64);
+```
+And the ERDP initial value at `xhci.rs:312`:
+```rust
+interrupter.erdp.update_volatile(|w| {
+    w.set_event_ring_dequeue_pointer(erst_seg_phys as u64);
+});
+```
+
+This is correct — the hardware uses physical addresses for the ERST and ERDP.
+
+**Verdict: CRITICAL RISK.** This is the most likely crash point. The double handoff, missing post-handoff delay, and SMM interaction on real hardware make this nearly guaranteed to fail.
 
 ---
 
-## 2. Frontend — React + Vite
+## AREA 5: ACPI / SMM Interaction
 
-The web dashboard lives in `frontend/` and is served directly by FastAPI after `npm run build`.
+### PureOS (`src/kernel/acpi.c:89-142`, `src/kernel/hal/acpi_osl.c:59-87`, `src/drivers/pci.c:233-276`)
 
-| Library | Purpose |
-|---|---|
-| **React 18** + **react-dom** | UI framework — SPA dashboard. |
-| **Vite 5** | Build tool and dev server (hot reload in dev, static bundle for production). |
-| **@vitejs/plugin-react** | React JSX support in Vite. |
-| **d3-hierarchy** | Renders the interactive **dependency graph** — vulnerable nodes glow red, attack paths highlighted, zoom/pan/collapse. |
-| **lucide-react** | Icon set for the dashboard UI. |
-| **@fontsource/inter**, **@fontsource/jetbrains-mono** | Inter UI font + JetBrains Mono for code/hash display. |
+**Gap 16: `_OSC` evaluation may change SMM behavior.**
 
-### Dev-only
-| Library | Purpose |
-|---|---|
-| **puppeteer-core** | UI check/screenshot automation (development only, not shipped). |
+```c
+// pci.c:233-276
+uint32_t caps[3] = {
+    0x00000000, // Query Support (Bit 0) and reserved
+    0x0000001F, // Support Field (Native Hot Plug, PME, AER, etc.)
+    0x0000001F  // Control Field
+};
+```
+
+On the Lenovo LOQ, `_OSC` is used by the firmware to negotiate PCIe/USB ownership. If PureOS sends the wrong capabilities or the firmware rejects the request, SMM behavior changes. The `_OSC` control field bits include:
+- Bit 0: PCI Express Native Hot Plug control
+- Bit 1: SHPC Native Hot Plug control
+- Bit 2: PCIe PME
+- Bit 3: PCIe Advanced Error Reporting
+- Bit 4: PCIe ACS (Access Control Services)
+
+PureOS requests control of ALL of these. Linux is much more conservative — it only requests capabilities it actually supports, and it checks the `_OSC` return buffer for denied capabilities. On the Lenovo LOQ, if the firmware denies some capabilities but PureOS assumes it has them, subsequent PCIe operations may fail.
+
+**Gap 17: No `_OSI` evaluation.**
+
+Linux evaluates `\_OSI` to inform the DSDT which OS is running:
+```c
+// Linux kernel: drivers/acpi/osl.c
+acpi_osi_init();
+// This calls AcpiEvaluateObject(ACPI_ROOT_OBJECT, "_OSI", &arg, NULL)
+// with arg = "Windows 2020" (or similar)
+```
+
+Many laptops have DSDT conditional code that changes behavior based on `_OSI`. For example:
+- USB power management may differ
+- PCIe ASPM (Active State Power Management) settings change
+- SMM behavior is conditioned on OS identity
+- Fan curve and thermal management differ
+
+Without `_OSI`, the DSDT uses a fallback path that may behave differently than expected. On the Lenovo LOQ, the DSDT likely has Windows-specific code paths that properly initialize USB legacy emulation. Without `_OSI`, these paths may not execute.
+
+**Gap 18: `AcpiOsMapMemory` identity-mapping assumption.**
+
+```c
+// acpi_osl.c:59-87
+void *AcpiOsMapMemory(ACPI_PHYSICAL_ADDRESS Where, ACPI_SIZE Length) {
+    if (Where + Length <= 0x40000000ULL) {
+        return (void *)(uintptr_t)Where; // Identity map < 1GB
+    }
+    if (Where >= 0xF0000000ULL && Where + Length <= 0x100000000ULL) {
+        return (void *)(uintptr_t)Where; // MMIO region 0xF0000000-0xFFFFFFFF
+    }
+    // Dynamic identity mapping for addresses above 1GB
+    // ...
+}
+```
+
+If ACPICA needs to access tables or registers above 4GB (which modern Intel platforms frequently have), the dynamic mapping section at `acpi_osl.c:69-86` creates page table entries. This uses `get_page()` to allocate and map pages, which works — but the identity-mapped virtual addresses may conflict with the kernel's higher-half mapping if addresses fall in the `0xC0000000-0xFFFFFFFF` range.
+
+**Gap 19: ACPICA table initialization order.**
+
+```c
+// acpi.c:95-123
+AcpiInitializeSubsystem();
+AcpiInitializeTables(NULL, 16, FALSE);
+AcpiLoadTables();
+AcpiEnableSubsystem(ACPI_FULL_INITIALIZATION);
+AcpiInitializeObjects(ACPI_FULL_INITIALIZATION);
+```
+
+The `AcpiEnableSubsystem(ACPI_FULL_INITIALIZATION)` call transitions the platform from LEGACY to ACPI mode by writing `acpi_enable` to the SMI_CMD port. On the Lenovo LOQ, this triggers an SMI that initializes the ACPI-specific SMM handlers. If this happens before the xHCI handoff is complete, the SMM handler may conflict with the OS's xHCI ownership.
+
+**Verdict: MEDIUM-HIGH RISK.** The `_OSC` evaluation and missing `_OSI` could cause firmware to leave SMM active or use unexpected code paths.
 
 ---
 
-## 3. CLI & Packaging
+## AREA 6: Interrupt Controller Setup
 
-| Tool | Purpose |
-|---|---|
-| **`sbomgen` CLI** | Python `argparse`-based command-line tool (`backend/sbomgen.py`). Scans folders/zips/GitHub URLs, emits `json`, `cyclonedx`, `spdx`, `spdx30`, `html`, `pdf`, and gates CI with `--fail-on <severity>` (exit code 2 = build failure). |
-| **PyInstaller** | Builds the single-file executables — `SBOM-Gen.spec` (windowed desktop app with icon) and `SBOM-Gen-CLI.spec` (console CLI). |
-| **Inno Setup** | `installer.iss` — Windows installer that bundles the built exe. |
+### PureOS (`src/kernel/hal/pic.c:6-33`, `src/kernel/hal/apic.c:31-93`)
+
+The init sequence is:
+
+```c
+// hal.c:33-51
+void hal_init() {
+    paging_init();      // Page tables
+    acpi_init();        // ACPI tables (PIC still in firmware state)
+    pic_init();         // Remap PIC, unmask IRQs
+    lapic_init();       // Enable LAPIC, configure IOAPIC, then disable PIC
+    smp_init();         // SMP init
+}
+```
+
+**Gap 20: PIC is enabled during ACPI/PCI init.**
+
+```c
+// pic.c:27-30
+outb(0x21, 0xF0); // Enable IRQ0,1,2,3,4,5,6,7 on master
+outb(0xA1, 0xEB); // Enable IRQ12 (mouse) and IRQ10 (NE2000) on slave
+```
+
+Between `pic_init()` and `lapic_init()`, the PIC is fully active and unmasks several IRQs. During this window:
+- Any stale PCI interrupt routed via the PIC will fire
+- The ISR vectors are set (from `idt_init()` + `isr_install()`) but the IOAPIC is not yet configured
+- On the Lenovo LOQ, the xHCI controller may have a legacy INTx interrupt routed to IRQ 10 (or similar) via the PIC
+- If this fires between `pic_init()` and `lapic_init()`, the handler may not be ready
+
+**Gap 21: No IOAPIC routing for xHCI.**
+
+The IOAPIC routes GSI 1 (keyboard → vector 33), GSI 2 (PIT → vector 32), and GSI 12 (mouse → vector 44) (`apic.c:73-83`):
+
+```c
+rs_ioapic_route(2, 32, cpus[0].apic_id, false, false);  // PIT
+rs_ioapic_route(1, 33, cpus[0].apic_id, false, false);  // Keyboard
+rs_ioapic_route(12, 44, cpus[0].apic_id, false, false); // Mouse
+```
+
+But **does not route the xHCI IRQ**. The xHCI controller on the Lenovo LOQ is likely on GSI 16-23 (PCI MSI/MSI-X range). PureOS never routes these through the IOAPIC.
+
+**Gap 22: INTx disabled but no MSI enabled.**
+
+```c
+// pci.c:290-291
+cmd2 |= (1 << 10); // Bit 10 (Interrupt Disable) = 1: no pin IRQs
+```
+
+PureOS disables INTx but never enables MSI. Linux's `xhci-pci.c` explicitly sets up MSI via:
+```c
+// Linux: drivers/usb/host/xhci-pci.c
+pci_alloc_irq_vectors(pdev, 1, 1, PCI_IRQ_MSI | PCI_IRQ_LEGACY);
+```
+
+On the Lenovo LOQ, the xHCI controller uses MSI by default. Without MSI:
+- No xHCI interrupts are delivered to the CPU
+- The event ring never advances via interrupt
+- `rust_xhci_handle_irq` never fires from hardware
+- The driver must rely entirely on timer-tick polling at 250 Hz
+- During initialization, the controller waits for command completion events that never arrive
+- Timeout paths fire, but the controller may be in an inconsistent state
+
+**Gap 23: Stale interrupts from PIC mode.**
+
+The PIC remapping at `pic.c:14-15` maps IRQ0 → vector 32, IRQ1 → vector 33, etc. If any hardware device generates a legacy interrupt before the IOAPIC takes over, the ISR vector may reference an unregistered handler. The `isr_install()` function registers ISR stubs for all 256 vectors, but the actual keyboard/mouse handlers are registered later in the driver init phase.
+
+**Gap 24: No I/O APIC identity for LAPIC.**
+
+The LAPIC is mapped at `local_apic_phys_addr` (from MADT, typically `0xFEE00000`). The kernel's paging maps `0xF0000000-0xFFFFFFFF` identity:
+
+```c
+// paging.c:153-160
+for (uint64_t i = 0xF0000000; i < 0x100000000ULL; i += 0x1000) {
+    page_t *page = get_page(i, 1, kernel_pml4);
+    page->present = 1;
+    page->rw = 1;
+    page->frame = i >> 12;
+}
+```
+
+This maps the LAPIC correctly for identity access. However, the `lapic_write` function at `apic.c:16-20` uses:
+```c
+volatile uint32_t *apic = (volatile uint32_t *)(uintptr_t)(local_apic_phys_addr + reg);
+*apic = data;
+```
+
+This relies on the identity map. If `local_apic_phys_addr` is not in the `0xF0000000-0xFFFFFFFF` range (some platforms put it elsewhere), this will page-fault.
+
+**Verdict: HIGH RISK.** No MSI setup means xHCI interrupts don't work. This causes the port scan to rely entirely on polling, which partially works but may miss critical events during initialization.
 
 ---
 
-## 4. Testing & Tooling
+## AREA 7: What Linux Does That PureOS Doesn't (Summary Table)
 
-| Tool | Purpose |
-|---|---|
-| **pytest** + FastAPI **TestClient** | E2E API tests, severity/regression tests, binary-artifact tests, CLI subprocess tests (`backend/tests/`). |
-| **pip** (`requirements.txt`) / **npm** (`package-lock.json`) | Dependency management for backend and frontend. |
-| **uvicorn / vite** | Local dev loop: backend on `:8000`, frontend on `:5173` (proxying `/api`). |
+| Subsystem | Linux | PureOS | Impact |
+|-----------|-------|--------|--------|
+| **Memory map** | Parses full UEFI memory map, skips reserved/MMIO regions, builds page tables with correct cache attributes (UC for MMIO, WB for RAM) | Blind 1GB identity map + hardcoded `0xF0000000` MMIO region | MMIO access to unmapped regions causes page fault |
+| **PCI scan** | All 256 buses, MCFG/ECAM support, extended config space access | Bus 0 only, legacy I/O ports (0xCF8/0xCFC) | May miss devices on non-zero buses |
+| **xHCI handoff** | One-shot: set OS bit, poll BIOS clear, disable SMI, **1-second delay**, then reset | Double handoff (C + Rust), no delay, potential SMM re-entry | SMM traps the reset, CPU freezes |
+| **MSI/MSI-X** | `pci_alloc_irq_vectors()` with MSI/MSI-X/legacy fallback | Never enables MSI, disables INTx | xHCI interrupts never fire from hardware |
+| **ACPI _OSI** | Evaluates `_OSI("Windows 2020")` to get correct DSDT behavior | Never evaluates `_OSI` | DSDT uses wrong code path, USB/SMM behavior differs |
+| **xHCI init** | Reset, wait CNR, configure MMIO, rings, port scan — all with proper cache attributes | MMIO mapped via virtual 0x200000000, Rust mapper returns physical as virtual | Potential virtual/physical confusion in xHCI crate |
+| **Cache control** | PAT-based UC/WC/WB for MMIO vs RAM | All memory mapped with default WB (except xHCI BAR which has PCD=1) | MMIO writes may be cached and never reach hardware |
+| **Post-handoff delay** | 1 second SMM settle time after USB Legacy handoff | Immediate reset | SMM interrupt during reset causes triple fault |
+| **`_OSC` negotiation** | Conservative, requests only needed capabilities, checks denied bits | Requests all capabilities, ignores denial | Firmware may refuse or change SMM behavior |
 
 ---
 
-## 5. Tech Stack at a Glance
+## RANKED CRASH CAUSES (Most Likely → Least Likely)
 
-| Layer | Technology |
-|---|---|
-| Backend API | Python · FastAPI · Uvicorn · Pydantic |
-| Frontend | React 18 · Vite 5 |
-| Dependency graph | d3-hierarchy (custom SVG) |
-| SBOM output | CycloneDX 1.5 (cyclonedx-python-lib) · SPDX 2.3/3.0 (hand-built) |
-| Vulnerability data | Bundled offline dataset + live OSV API · SQLite cache |
-| PDF reports | reportlab |
-| Binary parsing | pefile (PE) + hand-rolled ELF/wheel/JAR parsing |
-| Auth | PyJWT + bcrypt |
-| Persistence | SQLite (stdlib) |
-| Desktop packaging | pywebview · PyInstaller · Inno Setup |
-| CI/CD | `sbomgen` CLI with `--fail-on` gating |
+### 1. xHCI BIOS Handoff + SMM Interaction [CRITICAL]
+
+**Files:** `src/drivers/pci.c:322-397`, `rust/src/xhci.rs:138-176`
+
+**Root cause:** The double handoff creates an inconsistent ownership state. The C code sets OS Owned Semaphore (bit 24) and waits for BIOS to clear bit 16. Then the Rust code clears bit 16 again WITHOUT setting bit 24. On the Lenovo LOQ's Intel chipset, the SMM handler monitors USBLEGSUP. When PureOS resets the xHCI controller without completing the proper handoff sequence, the SMM handler traps the reset command, enters SMM mode, and the CPU either freezes in SMM or returns to corrupted OS state.
+
+Additionally, the missing 1-second post-handoff delay means SMM is still processing when the controller reset is issued.
+
+**Fix:** Remove the Rust-side stealth handoff. Do a single, proper handoff in C with a 1-second post-handoff delay, then pass the MMIO base to Rust. Match Linux's `xhci-pci.c:usb_do_external_hub()` sequence exactly.
+
+### 2. Missing MSI/MSI-X Setup [HIGH]
+
+**Files:** `src/drivers/pci.c:288-291`
+
+**Root cause:** Disabling INTx without enabling MSI means the xHCI controller has no way to deliver interrupts via hardware. The timer-tick polling at 250 Hz partially compensates but misses events during the critical initialization window. Command completion events, port status changes, and transfer events may all be missed.
+
+**Fix:** Implement `pci_alloc_irq_vectors()` equivalent that queries MSI capability from config space and programs the IOAPIC/APIC for MSI delivery.
+
+### 3. PCI Bus Scan Too Narrow [HIGH]
+
+**File:** `src/drivers/pci.c:427`
+
+**Root cause:** Scanning only bus 0 will miss xHCI if it is behind a PCIe root port on the LOQ. The LOQ's Intel chipset routes USB through a root port complex that may place the xHCI controller on bus 1 or higher.
+
+**Fix:** Scan all 256 buses. Implement proper PCI topology enumeration (check multi-function devices, PCI-to-PCI bridges).
+
+### 4. MMIO Mapping Virtual/Physical Confusion [MEDIUM-HIGH]
+
+**Files:** `src/drivers/pci.c:184-226`, `rust/src/xhci.rs:8-11`
+
+**Root cause:** The C code maps the xHCI BAR to virtual `0x200000000`, but the Rust `MemoryMapper` returns physical addresses as virtual. The `xhci::Registers::new()` receives the virtual base (`0x200000000`) and adds register offsets to it — this part works. But the Rust `xhci` crate's internal `Mapper::map()` calls (if any exist) would get wrong addresses, leading to MMIO access at incorrect virtual addresses.
+
+**Fix:** Either identity-map the xHCI BAR (simpler) or ensure the Rust mapper returns `0x200000000` as the base for all internal translations.
+
+### 5. Missing `_OSI` Evaluation [MEDIUM]
+
+**File:** `src/kernel/acpi.c` (not present)
+
+**Root cause:** The DSDT on the Lenovo LOQ has conditional code paths for different operating systems. Without `_OSI`, the firmware may leave USB in a state that conflicts with xHCI ownership, or may use a DSDT code path that does not properly initialize USB legacy emulation.
+
+**Fix:** Add `AcpiEvaluateObject(ACPI_ROOT_OBJECT, "_OSI", ...)` with "Windows 2020" (or "Linux") before any other ACPI evaluation.
+
+### 6. PIC Enabled During Critical Window [MEDIUM]
+
+**Files:** `src/kernel/hal/hal.c:42-46`, `src/kernel/hal/pic.c:27-30`
+
+**Root cause:** Between `pic_init()` and `lapic_init()`, the PIC is fully active and unmasks several IRQs. A stale interrupt during this window (especially IRQ 10 which PureOS unmaps on the slave PIC) could vector to an unset handler.
+
+**Fix:** Move `pic_init()` after `lapic_init()`, or mask all PIC interrupts immediately before enabling APIC.
+
+### 7. No Cache Attribute Control for MMIO [LOW-MEDIUM]
+
+**Files:** `src/kernel/hal/paging.c:88-97`, `src/drivers/pci.c:196-215`
+
+**Root cause:** xHCI MMIO registers should be mapped with uncacheable (PCD=1) or write-combining (PAT) attributes. PureOS maps the xHCI BAR correctly (PCD=1 at `pci.c:211`), but the kernel's `paging_init()` at `paging.c:88-97` maps all 0-1GB identity memory with default write-back caching. Any other device memory in this range will have incorrect cache attributes.
+
+**Fix:** Set PCD=1 and PAT=0 (UC) for all MMIO mappings in the identity map. Use the UEFI memory map to distinguish MMIO regions from RAM.
+
+### 8. `_OSC` Capability Negotiation [LOW-MEDIUM]
+
+**Files:** `src/drivers/pci.c:233-276`
+
+**Root cause:** PureOS requests all PCIe capabilities (`0x0000001F`) without checking which ones the firmware actually grants. Linux checks the returned capability bits and adjusts its behavior for denied capabilities. If the Lenovo LOQ's firmware denies certain capabilities but PureOS assumes it has them, subsequent PCIe operations (hot plug, AER, etc.) may fail or trigger unexpected firmware behavior.
+
+**Fix:** Check the `_OSC` return buffer for denied capabilities and adjust behavior accordingly.
+
+---
+
+## RECOMMENDED FIX PRIORITY
+
+| Priority | Fix | Risk Addressed | Effort |
+|----------|-----|----------------|--------|
+| **P0** | Fix xHCI handoff: single handoff in C, 1s delay, no Rust re-handoff | Crash cause #1 | Low |
+| **P1** | Enable MSI: query MSI capability, program IOAPIC/APIC | Crash cause #2 | Medium |
+| **P1** | Scan all PCI buses (change `bus < 1` to `bus < 256`) | Crash cause #3 | Trivial |
+| **P2** | Add `_OSI` evaluation | Crash cause #5 | Trivial |
+| **P2** | Fix MMIO cache attributes (PCD/PAT) | Crash cause #7 | Low |
+| **P2** | Fix `_OSC` negotiation (check return buffer) | Crash cause #8 | Low |
+| **P3** | Fix PIC enabled during critical window | Crash cause #6 | Trivial |
+| **P3** | Fix MMIO virtual/physical confusion in Rust layer | Crash cause #4 | Medium |
+
+---
+
+## APPENDIX: File Reference
+
+| File | Lines | Purpose |
+|------|-------|---------|
+| `src/boot/uefi/boot.c` | 1-683 | UEFI bootloader: page table setup, ExitBootServices, GDT, jump to kernel |
+| `src/kernel/kernel.c` | 1-1225 | Kernel main init sequence, driver init order |
+| `src/kernel/hal/paging.c` | 1-436 | Kernel page table setup, identity map, higher-half, page fault handler |
+| `src/drivers/pci.c` | 1-478 | PCI enumeration (legacy I/O), xHCI discovery, BIOS handoff, _OSC |
+| `src/kernel/acpi.c` | 1-193 | ACPICA initialization, MADT parsing, shutdown/reboot |
+| `src/kernel/hal/acpi_osl.c` | 1-262 | ACPI OS layer: memory mapping, PCI config access, spinlocks |
+| `rust/src/xhci.rs` | 1-1475 | Rust xHCI driver: controller reset, port scan, HID keyboard |
+| `src/kernel/hal/hal.c` | 1-58 | HAL init: GDT, IDT, paging, ACPI, PIC, APIC, SMP |
+| `src/kernel/hal/apic.c` | 1-104 | Local APIC + IOAPIC setup, IRQ routing |
+| `src/kernel/hal/pic.c` | 1-33 | Legacy PIC remapping and IRQ masking |
+| `src/kernel/hal/idt.c` | 1-29 | IDT setup |
+| `src/kernel/hal/gdt.c` | 1-129 | GDT + TSS setup |
+| `src/kernel/memmap.c` | 1-90 | UEFI memory map parsing for heap placement |
+| `src/kernel/heap.h` | 1-40 | Heap configuration, kmalloc_ap (32-bit phys) |
+| `src/boot/boot_info.h` | 1-32 | Boot info structure passed from bootloader to kernel |
+| `build.bat` | 1-523+ | Compiler flags, `-DPUREOS_OS_OWNS_XHCI` enabled |
+| `run_os.bat` | 1-5 | QEMU flags: 4GB RAM, OVMF UEFI, bochs-display, qemu-xhci |
