@@ -2,7 +2,7 @@
 
 **AI-Powered Predictive Analytics & Early Warning System for Infrastructure Monitoring**
 
-**Team Project | Smart India Hackathon 2024**
+**Team Project | Smart India Hackathon 2026**
 
 ---
 
@@ -289,4 +289,4 @@ python backend/ml/train_pipeline.py
 
 ---
 
-*Document generated for team reference — PAIMANA AI, SIH 2024*
+*Document generated for team reference — PAIMANA AI, SIH 2026*
